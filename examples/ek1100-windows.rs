@@ -1,7 +1,22 @@
-//! A simple test program that demonstrates tweaks recommended to improve performance on Windows.
+//! Bring up a Beckhoff EK1100/EK1501 and modules on **Windows** and cycle process data.
 //!
-//! Tested on Windows 11, i5-8500T, Intel i219-LM NIC. Your mileage may vary! Please open Github
-//! issue with a Wireshark capture if you encounter perf issues.
+//! Windows-specific version of the `ek1100` example: the blocking Npcap-backed
+//! [`tx_rx_task_blocking`](ethercrab::std::tx_rx_task_blocking) runs on its own OS thread (there
+//! is no async TX/RX backend on Windows), `spin_sleep` + `quanta` drive the cycle timing (the
+//! default Windows timer resolution of ~15 ms is too coarse), and `wait_loop_delay` is set to
+//! `Duration::ZERO` to avoid spurious timeouts. The TX/RX thread runs at `TimeCritical` priority
+//! and is pinned to its own core, which is what keeps packet round trip times from spiking.
+//!
+//! Build/runtime setup (Npcap SDK + runtime, finding the `\Device\NPF_{...}` interface name):
+//! see `doc/ek1100-windows.md`. Performance tuning: see `doc/windows-tuning.md`.
+//!
+//! Run with e.g.
+//!
+//! ```ps
+//! $env:LIBPCAP_LIBDIR = 'C:\Npcap-SDK\Lib\x64'
+//! $env:RUST_LOG = 'info'
+//! cargo run --release --example ek1100-windows -- '\Device\NPF_{FF0ACEE6-E8CD-48D5-A399-619CD2340465}'
+//! ```
 
 #[cfg(windows)]
 #[tokio::main]
@@ -9,6 +24,7 @@ async fn main() -> Result<(), ethercrab::error::Error> {
     use env_logger::Env;
     use ethercrab::{
         MainDevice, MainDeviceConfig, PduStorage, Timeouts,
+        error::Error,
         std::{TxRxTaskConfig, ethercat_now, tx_rx_task_blocking},
     };
     use spin_sleep::{SpinSleeper, SpinStrategy};
@@ -36,9 +52,9 @@ async fn main() -> Result<(), ethercrab::error::Error> {
 
     let interface = std::env::args()
         .nth(1)
-        .expect("Provide network interface as first argument.");
+        .expect("Provide network interface as first argument, e.g. '\\Device\\NPF_{...}'.");
 
-    log::info!("Starting EK1100/EK1501 demo...");
+    log::info!("Starting EK1100/EK1501 demo (Windows)...");
     log::info!(
         "Ensure an EK1100 or EK1501 is the first SubDevice, with any number of modules connected after"
     );
@@ -49,11 +65,11 @@ async fn main() -> Result<(), ethercrab::error::Error> {
     let maindevice = Arc::new(MainDevice::new(
         pdu_loop,
         Timeouts {
-            // Windows timers are rubbish (min delay is ~15ms) which will cause a bunch of timeouts
-            // if `wait_loop_delay` is anything above 0.
+            // Windows timers are coarse (~15ms min), which causes spurious timeouts if
+            // `wait_loop_delay` is anything above zero.
             wait_loop_delay: Duration::ZERO,
             eeprom: Duration::from_millis(50),
-            // Other timeouts can be left alone, or increased if other issues are found.
+            mailbox_response: Duration::from_millis(1000),
             ..Default::default()
         },
         MainDeviceConfig {
@@ -65,28 +81,39 @@ async fn main() -> Result<(), ethercrab::error::Error> {
 
     let core_ids = core_affinity::get_core_ids().expect("Get core IDs");
 
-    // Pick the non-HT cores on my Intel i5-8500T test system. YMMV!
+    // Core 2 skips the hyperthread sibling of core 0 on an Intel i5-8500T test system. YMMV!
+    // Falling back to core 0 keeps small machines working, at the cost of the two threads
+    // contending for one core.
     let main_thread_core = core_ids[0];
-    let tx_rx_core = core_ids[2];
+    let tx_rx_core = *core_ids.get(2).unwrap_or_else(|| {
+        log::warn!(
+            "Only {} core(s) available, sharing one with the TX/RX thread. Expect worse cycle timing.",
+            core_ids.len()
+        );
 
-    // Pinning this and the TX/RX thread reduce packet RTT spikes significantly
+        &core_ids[0]
+    });
+
+    // Pinning this and the TX/RX thread reduce packet RTT spikes significantly.
     core_affinity::set_for_current(main_thread_core);
 
-    // Both `smol` and `tokio` use Windows' coarse timer, which has a resolution of at least
-    // 15ms. This isn't useful for decent cycle times, so we use a more accurate clock from
-    // `quanta` and a spin sleeper to get better timing accuracy.
+    // Both `smol` and `tokio` use Windows' coarse timer, which has a resolution of at least 15ms.
+    // That is not useful for decent cycle times, so use a more accurate clock from `quanta` and a
+    // spin sleeper instead.
     let sleeper = SpinSleeper::default().with_spin_strategy(SpinStrategy::SpinLoopHint);
 
     // NOTE: This takes ~200ms to return, so it must be called before any proper EtherCAT stuff
     // happens.
     let clock = quanta::Clock::new();
 
+    // The Windows TX/RX backend is blocking, so run it on a dedicated OS thread.
+    //
     // For best performance, use e.g.
     // https://www.techpowerup.com/download/microsoft-interrupt-affinity-tool/ to pin NIC IRQs to
     // the same core as the TX/RX thread.
     thread_priority::ThreadBuilder::default()
         .name("tx-rx-thread")
-        // For best performance, this MUST be set if pinning NIC IRQs to the same core
+        // For best performance, this MUST be set if pinning NIC IRQs to the same core.
         .priority(ThreadPriority::Os(ThreadPriorityOsValue::from(
             WinAPIThreadPriority::TimeCritical,
         )))
@@ -98,9 +125,9 @@ async fn main() -> Result<(), ethercrab::error::Error> {
             tx_rx_task_blocking(&interface, tx, rx, TxRxTaskConfig { spinloop: false })
                 .expect("TX/RX task");
         })
-        .unwrap();
+        .expect("spawn TX/RX thread");
 
-    let mut group = maindevice
+    let group = maindevice
         .init_single_group::<MAX_SUBDEVICES, PDI_LEN>(ethercat_now)
         .await
         .expect("Init");
@@ -108,6 +135,8 @@ async fn main() -> Result<(), ethercrab::error::Error> {
     log::info!("Discovered {} SubDevices", group.len());
 
     for subdevice in group.iter(&maindevice) {
+        // Special case: if an EL3004 module is discovered, it needs some specific config during
+        // init to function properly.
         if subdevice.name() == "EL3004" {
             log::info!("Found EL3004. Configuring...");
 
@@ -116,18 +145,10 @@ async fn main() -> Result<(), ethercrab::error::Error> {
             subdevice
                 .sdo_write_array(0x1c13, &[0x1a00u16, 0x1a02, 0x1a04, 0x1a06])
                 .await?;
-
-            // The `sdo_write_array` call above is equivalent to the following
-            // subdevice.sdo_write(0x1c13, 0, 0u8).await?;
-            // subdevice.sdo_write(0x1c13, 1, 0x1a00u16).await?;
-            // subdevice.sdo_write(0x1c13, 2, 0x1a02u16).await?;
-            // subdevice.sdo_write(0x1c13, 3, 0x1a04u16).await?;
-            // subdevice.sdo_write(0x1c13, 4, 0x1a06u16).await?;
-            // subdevice.sdo_write(0x1c13, 0, 4u8).await?;
         }
     }
 
-    let mut group = group.into_op(&maindevice).await.expect("PRE-OP -> OP");
+    let group = group.into_op(&maindevice).await.expect("PRE-OP -> OP");
 
     for subdevice in group.iter(&maindevice) {
         let io = subdevice.io_raw();
@@ -147,10 +168,12 @@ async fn main() -> Result<(), ethercrab::error::Error> {
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))
         .expect("Register hook");
 
+    log::info!("Cycling process data. Press Ctrl + C to stop.");
+
     loop {
         let now = clock.now();
 
-        // Graceful shutdown on Ctrl + C
+        // Graceful shutdown on Ctrl + C.
         if shutdown.load(Ordering::Relaxed) {
             log::info!("Shutting down...");
 
@@ -159,8 +182,8 @@ async fn main() -> Result<(), ethercrab::error::Error> {
 
         group.tx_rx(&maindevice).await.expect("TX/RX");
 
-        // Increment every output byte for every SubDevice by one
-        for mut subdevice in group.iter(&maindevice) {
+        // Increment every output byte for every SubDevice by one.
+        for subdevice in group.iter(&maindevice) {
             let mut o = subdevice.outputs_raw_mut();
 
             for byte in o.iter_mut() {
@@ -176,26 +199,21 @@ async fn main() -> Result<(), ethercrab::error::Error> {
         .into_safe_op(&maindevice)
         .await
         .expect("OP -> SAFE-OP");
-
     log::info!("OP -> SAFE-OP");
 
     let group = group
         .into_pre_op(&maindevice)
         .await
         .expect("SAFE-OP -> PRE-OP");
-
     log::info!("SAFE-OP -> PRE-OP");
 
     let _group = group.into_init(&maindevice).await.expect("PRE-OP -> INIT");
-
     log::info!("PRE-OP -> INIT, shutdown complete");
 
-    Ok(())
+    Ok::<(), Error>(())
 }
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!(
-        "Windows-only - the performance changes in this example don't make sense for other OSes"
-    );
+    eprintln!("This example is Windows-only. Use the `ek1100` example on other platforms.");
 }

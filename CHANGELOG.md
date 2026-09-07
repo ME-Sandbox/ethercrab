@@ -18,6 +18,11 @@ A pure Rust EtherCAT MainDevice supporting std and no_std environments.
   (`total_propagation_time`, `propagation_time_to`, `assign_next_downstream_port`, …) stay
   crate-internal as well.
 
+- Ethernet over EtherCAT (EoE) wire types: `EoeHeader`, `FrameType`, `EoeResult` and
+  `Fragment`, ported from the ETG.1000.6 layout. The second header word is a union -
+  fragment bookkeeping for data frames, a result code for `InitResp` - so it is read
+  through `EoeHeader::fragment()` and `EoeHeader::result()` rather than exposed raw.
+
 ## [0.7.1] - 2026-03-23
 
 ### Fixed

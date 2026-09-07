@@ -200,6 +200,7 @@ pub use register::{DcSupport, RegisterAddress};
 pub use subdevice::{
     DcSync, ObjectDescriptionListQuery, ObjectDescriptionListQueryCounts, SubDevice,
     SubDeviceIdentity, SubDevicePdi, SubDeviceRef,
+    ports::{Port, Ports, Topology},
 };
 pub use subdevice_group::{GroupId, SubDeviceGroup, SubDeviceGroupHandle, TxRxResponse};
 pub use subdevice_state::SubDeviceState;

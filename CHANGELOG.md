@@ -6,6 +6,18 @@ A pure Rust EtherCAT MainDevice supporting std and no_std environments.
 
 ## [Unreleased] - ReleaseDate
 
+### Added
+
+- Publicly expose `Port`, `Ports` and `Topology`, and add `SubDevice::ports()`, so crate
+  consumers can read the network topology EtherCrab already discovers during `init()`
+  without walking the ports a second time.
+
+  `Ports` is deliberately read-only from outside: its raw field and its `Default` impl are
+  crate-internal, because an all-inactive `Ports` is a state `topology()` and
+  `entry_port()` cannot answer for. The Distributed Clocks helpers on it
+  (`total_propagation_time`, `propagation_time_to`, `assign_next_downstream_port`, …) stay
+  crate-internal as well.
+
 ## [0.7.1] - 2026-03-23
 
 ### Fixed

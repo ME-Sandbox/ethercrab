@@ -254,6 +254,26 @@ impl SubDevice {
         self.oversampling_config = oversampling_config
     }
 
+    /// The state of this SubDevice's four ports, and with it the shape it forms in the
+    /// network.
+    ///
+    /// EtherCrab discovers this during [`MainDevice::init`](crate::MainDevice::init) by
+    /// walking every port of every device. Reading it back is what lets a dependent crate
+    /// reason about the wiring - which device is a line end, where the network forks -
+    /// without discovering the topology a second time.
+    ///
+    /// ```rust,no_run
+    /// # use ethercrab::{SubDevice, Topology};
+    /// # fn example(subdevice: &SubDevice) {
+    /// if subdevice.ports().topology() == Topology::LineEnd {
+    ///     // Nothing is attached downstream of this one.
+    /// }
+    /// # }
+    /// ```
+    pub fn ports(&self) -> &Ports {
+        &self.ports
+    }
+
     /// Get the SubDevice's human readable short name.
     ///
     /// To get a longer, more descriptive name, use [`SubDevice::description`].
@@ -864,5 +884,41 @@ impl<'maindevice, S> SubDeviceRef<'maindevice, S> {
             .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::subdevice::ports::{Ports, Topology};
+
+    #[test]
+    fn the_ports_a_subdevice_walked_are_readable() {
+        // `init()` fills these in and nothing could read them back. A dependent crate has
+        // to know which SubDevice sits where before it can reason about the wiring.
+        let subdevice = SubDevice {
+            ports: Ports::new(true, false, false, false),
+            ..Default::default()
+        };
+
+        assert_eq!(subdevice.ports().topology(), Topology::LineEnd);
+    }
+
+    #[test]
+    fn the_entry_port_is_the_one_that_sees_the_frame_first() {
+        // NOT "the first active port". `entry_port()` picks the smallest DC receive time,
+        // and with every time left at zero the two rules are indistinguishable - a test
+        // that leaves them at zero passes against either and pins neither.
+        let mut ports = Ports::new(true, true, false, false);
+        ports.0[0].dc_receive_time = 500;
+        ports.0[1].dc_receive_time = 100;
+
+        let subdevice = SubDevice {
+            ports,
+            ..Default::default()
+        };
+
+        // Port 3 is stored second but is seen first, so it is the entry port.
+        assert_eq!(subdevice.ports().entry_port().number, 3);
     }
 }

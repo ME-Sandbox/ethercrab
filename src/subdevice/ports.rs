@@ -5,7 +5,17 @@ use core::{fmt::Debug, num::NonZeroU16};
 #[derive(Default, Debug, PartialEq, Eq, Copy, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Port {
+    /// Whether this port has a physical link on it.
+    ///
+    /// Read from `DlStatus::link_portN`. It says a link is present, not what is on the
+    /// other end: on the first SubDevice of a network, port 0's link goes to the
+    /// MainDevice's network interface, not to another SubDevice.
     pub active: bool,
+    /// Distributed Clocks receive time at this port, in nanoseconds.
+    ///
+    /// The difference between two ports' receive times is a **loop** time - out and back
+    /// again - so a one-way cable delay is half of it. `dc.rs` halves every one of these
+    /// differences.
     pub dc_receive_time: u32,
     /// The EtherCAT port number, ordered as 0 -> 3 -> 1 -> 2.
     pub number: u8,
@@ -26,7 +36,9 @@ impl Port {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+/// The shape a SubDevice forms in the network, derived from how many of its ports are
+/// open.
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Topology {
     /// The SubDevice has two open ports, with only upstream and downstream subdevices.
@@ -40,14 +52,28 @@ pub enum Topology {
 }
 
 impl Topology {
+    /// Whether the topology branches here, i.e. whether it is a [`Fork`](Self::Fork) or a
+    /// [`Cross`](Self::Cross).
     pub fn is_junction(&self) -> bool {
         matches!(self, Self::Fork | Self::Cross)
     }
 }
 
-#[derive(Default, Copy, Clone, Debug, PartialEq)]
+/// The four ports of a SubDevice, in EtherCAT order: 0, 3, 1, 2.
+///
+/// That order is the order a frame travels through the device, not the numeric order.
+///
+/// Obtained from [`SubDevice::ports`](crate::SubDevice::ports); there is deliberately no
+/// way to build one from outside the crate. The port numbers carry an invariant that
+/// several methods rely on, and a `Ports` assembled by hand - or defaulted, with no active
+/// port at all - would break it.
+#[derive(Copy, Clone, Debug, PartialEq)]
+// Gated the way `SubDevice` gates its own `Default`, and for the same reason: an
+// all-inactive `Ports` is an invalid state that `topology()` and `entry_port()` cannot
+// answer for.
+#[cfg_attr(test, derive(Default))]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct Ports(pub [Port; 4]);
+pub struct Ports(pub(crate) [Port; 4]);
 
 impl core::fmt::Display for Ports {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -143,7 +169,7 @@ impl Ports {
     }
 
     /// Get the last open port.
-    pub fn last_port(&self) -> Option<&Port> {
+    pub(crate) fn last_port(&self) -> Option<&Port> {
         self.active_ports().last()
     }
 
@@ -165,7 +191,7 @@ impl Ports {
     }
 
     /// Link a downstream device to the current device using the next open port from the entry port.
-    pub fn assign_next_downstream_port(
+    pub(crate) fn assign_next_downstream_port(
         &mut self,
         downstream_subdevice_index: NonZeroU16,
     ) -> Option<u8> {
@@ -184,6 +210,7 @@ impl Ports {
             .find(|port| port.downstream_to.map(|idx| idx.get()) == Some(subdevice.index))
     }
 
+    /// The shape this SubDevice forms, derived from the number of open ports.
     pub fn topology(&self) -> Topology {
         match self.open_ports() {
             1 => Topology::LineEnd,
@@ -194,13 +221,17 @@ impl Ports {
         }
     }
 
-    pub fn is_last_port(&self, port: &Port) -> bool {
+    /// Whether the given port is the last active one.
+    ///
+    /// That is the port the line *continues* through: a device hanging off it is the next
+    /// one downstream rather than a child of this one.
+    pub(crate) fn is_last_port(&self, port: &Port) -> bool {
         self.last_port().filter(|p| *p == port).is_some()
     }
 
     /// The time in nanoseconds for a packet to completely traverse all active ports of a SubDevice.
     #[deny(clippy::arithmetic_side_effects)]
-    pub fn total_propagation_time(&self) -> Option<u32> {
+    pub(crate) fn total_propagation_time(&self) -> Option<u32> {
         let times = self
             .0
             .iter()
@@ -215,7 +246,7 @@ impl Ports {
 
     /// Propagation time between active ports in this SubDevice.
     #[deny(clippy::arithmetic_side_effects)]
-    pub fn intermediate_propagation_time_to(&self, port: &Port) -> u32 {
+    pub(crate) fn intermediate_propagation_time_to(&self, port: &Port) -> u32 {
         // If a pair of ports is open, they have a propagation delta between them, and we can sum
         // these deltas up to get the child delays of this SubDevice (fork or cross have children)
         self.0
@@ -241,7 +272,7 @@ impl Ports {
 
     /// Get the propagation time taken from entry to this SubDevice up to the given port.
     #[deny(clippy::arithmetic_side_effects)]
-    pub fn propagation_time_to(&self, this_port: &Port) -> Option<u32> {
+    pub(crate) fn propagation_time_to(&self, this_port: &Port) -> Option<u32> {
         let entry_port = self.entry_port();
 
         // Find active ports between entry and this one

@@ -23,7 +23,8 @@ A pure Rust EtherCAT MainDevice supporting std and no_std environments.
 
   The second header word is a union with three states - fragment bookkeeping on a data
   frame, a result code on a response, and nothing at all on a request - so it is read
-  through `EoeHeader::second_word()` rather than exposed raw. Its offset field is
+  through `EoeHeader::second_word()` - or the `fragment()` / `result()` conveniences over
+  it - rather than exposed raw. Its offset field is
   overloaded in turn: on the first fragment it carries the total frame size, on the rest
   the byte offset, which `Fragment::total_frame_size()` and `Fragment::offset()` keep
   apart.

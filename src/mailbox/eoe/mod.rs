@@ -67,6 +67,9 @@ pub enum EoeResult {
 /// side mirrors it (`:480` takes the buffer size from fragment zero, `:502` compares the
 /// offset for the rest). Hence two accessors, each `None` when the raw value does not mean
 /// what it asks for.
+///
+/// Read from an [`EoeHeader`]; `raw_offset` is private, so one cannot be fabricated from
+/// outside the crate. Matching on it and reading its fields works as usual.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Fragment {
@@ -152,16 +155,32 @@ pub struct EoeHeader {
 ///
 /// | frame type | second word | evidence |
 /// |---|---|---|
-/// | `FragData` | fragment bookkeeping | `ec_eoe.c:384-393` writes it, `:474-505` reads it |
-/// | the four request types | unused, written as zero | `ec_eoe.c:97`, `:216` |
-/// | the response types | a result code | `ec_eoe.c:157` for `InitResp` |
+/// | `FragData` | fragment bookkeeping | `ec_eoe.c:384-394` writes it, `:465-505` reads it |
+/// | `InitReq`, `GetIpParamReq` | unused, written as zero | `ec_eoe.c:97`, `:216` |
+/// | `InitResp` | a result code | `ec_eoe.c:157` |
 ///
-/// The reference implementation only ever *reads* a result for `InitResp`; it implements
-/// neither address filters nor the timestamp response, so for `InitRespTimestamp`,
-/// `SetAddrFilterResp`, `GetAddrFilterResp` and `GetIpParamResp` it is silent. Those follow
-/// ETG.1000.6, where the word is the result of the request they answer - and it has to be
-/// so for [`EoeResult::NoFilterSupport`] to be reachable at all, since it can only ever
-/// arrive on an address filter response.
+/// **The remaining four are not from the reference implementation.** They are listed
+/// separately rather than blended into the rows above:
+///
+/// * `SetAddrFilterReq` and `GetAddrFilterReq` are treated as the other two requests. SOEM
+///   builds neither frame, so there is nothing to cite; a request that carries neither
+///   fragments nor an answer leaves nothing else for the word to be.
+/// * `SetAddrFilterResp` and `GetAddrFilterResp` carry a result per ETG.1000.6. It has to
+///   be so for [`EoeResult::NoFilterSupport`] to be reachable at all - that code can only
+///   ever arrive on an address filter response.
+/// * `GetIpParamResp` carries a result. SOEM **does** implement this frame type
+///   (`ecx_EOEgetIp`, `ec_eoe.c:238` onwards); it simply never reads the second word and
+///   goes straight to the include flags in `data[0]` (`:244`).
+/// * `InitRespTimestamp` is an **assumption**, and the weakest cell in this table. SOEM
+///   neither sends nor recognises frame type 1 - `ecx_EOErecv` reads `frameinfo2` as
+///   fragment bookkeeping without checking the type at all (`:465`) - and the only
+///   timestamp evidence to hand says the timestamp is 32 bits appended to the payload
+///   (`:519-522`), which says nothing about this 16 bit word. Treating it like the other
+///   responses is a guess, not evidence.
+// The state count has already gone from two to three once. A fourth would otherwise break
+// every downstream `match`; `TxRxResponse` in this crate carries the attribute for the same
+// reason.
+#[non_exhaustive]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum SecondWord {
@@ -228,6 +247,8 @@ impl EoeHeader {
     }
 
     /// Fragment bookkeeping, or `None` if this frame carries none.
+    ///
+    /// A convenience over [`second_word`](Self::second_word) for the common case.
     pub fn fragment(&self) -> Option<Fragment> {
         match self.second_word() {
             SecondWord::Fragment(fragment) => Some(fragment),
@@ -236,6 +257,8 @@ impl EoeHeader {
     }
 
     /// The result of the request this frame answers, or `None` if it answers none.
+    ///
+    /// A convenience over [`second_word`](Self::second_word) for the common case.
     pub fn result(&self) -> Option<Result<EoeResult, u16>> {
         match self.second_word() {
             SecondWord::Result(result) => Some(result),
@@ -606,6 +629,9 @@ mod tests {
             let unpacked = EoeHeader::unpack_from_slice(&packed).expect("Unpack");
 
             pretty_assertions::assert_eq!(header, unpacked);
+            // Without this the closure never touches the union at all - a `panic!()` as
+            // the first statement of `second_word()` left this test passing.
+            pretty_assertions::assert_eq!(header.second_word(), unpacked.second_word());
 
             Ok(())
         });

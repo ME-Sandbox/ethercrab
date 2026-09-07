@@ -193,7 +193,7 @@ pub use ethercrab_wire::{
 };
 use ethernet::EthernetAddress;
 pub use mailbox::coe::SubIndex;
-pub use mailbox::eoe::{EoeHeader, EoeResult, FrameType};
+pub use mailbox::eoe::{EoeHeader, EoeResult, Fragment, FrameType, SecondWord};
 pub use maindevice::MainDevice;
 pub use maindevice_config::{MainDeviceConfig, RetryBehaviour};
 pub use pdu_loop::{PduLoop, PduRx, PduStorage, PduTx, ReceiveAction, SendableFrame};

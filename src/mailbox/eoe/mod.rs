@@ -10,6 +10,7 @@
 /// `EOE_GET_ADDR_FILTER_RESP` defines. Values 10 to 15 fit the field but are not defined;
 /// decoding one is an error rather than a panic.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ethercrab_wire::EtherCrabWireReadWrite)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
 pub enum FrameType {
@@ -145,6 +146,37 @@ pub struct EoeHeader {
     second_word: u16,
 }
 
+/// What the second header word of an [`EoeHeader`] means.
+///
+/// It is a `union` in the reference implementation and has **three** states, not two:
+///
+/// | frame type | second word | evidence |
+/// |---|---|---|
+/// | `FragData` | fragment bookkeeping | `ec_eoe.c:384-393` writes it, `:474-505` reads it |
+/// | the four request types | unused, written as zero | `ec_eoe.c:97`, `:216` |
+/// | the response types | a result code | `ec_eoe.c:157` for `InitResp` |
+///
+/// The reference implementation only ever *reads* a result for `InitResp`; it implements
+/// neither address filters nor the timestamp response, so for `InitRespTimestamp`,
+/// `SetAddrFilterResp`, `GetAddrFilterResp` and `GetIpParamResp` it is silent. Those follow
+/// ETG.1000.6, where the word is the result of the request they answer - and it has to be
+/// so for [`EoeResult::NoFilterSupport`] to be reachable at all, since it can only ever
+/// arrive on an address filter response.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum SecondWord {
+    /// Fragment bookkeeping. Only a data frame carries it.
+    Fragment(Fragment),
+    /// The result of the request this frame answers.
+    ///
+    /// `Err` carries the raw value when it matches no `EOE_RESULT_*` - worth reporting
+    /// rather than discarding, and not a reason to fail decoding the header.
+    Result(Result<EoeResult, u16>),
+    /// Nothing. A request carries no second word; the reference implementation writes zero
+    /// and never looks at it.
+    Unused,
+}
+
 impl EoeHeader {
     const FRAGMENT_NO: (u16, u16) = (0x003F, 0);
     const FRAME_OFFSET: (u16, u16) = (0x003F, 6);
@@ -166,35 +198,49 @@ impl EoeHeader {
         ((self.second_word >> shift) & mask) as u8
     }
 
-    /// Whether this frame type's second word is a result code rather than fragment info.
+    /// What the second word means for this frame, decided by the frame type alone.
     ///
-    /// Only `InitResp`: it is the one type the reference implementation reads a result for
-    /// (`ec_eoe.c:157`). `GetIpParamResp` carries its status in the payload instead and
-    /// SOEM skips the word entirely (`:238`).
-    fn carries_result(self) -> bool {
-        matches!(self.frame_type, FrameType::InitResp)
-    }
-
-    /// Fragment bookkeeping, or `None` if this frame type's second word is a result code.
-    pub fn fragment(&self) -> Option<Fragment> {
-        (!self.carries_result()).then(|| Fragment {
-            number: self.get(Self::FRAGMENT_NO),
-            raw_offset: self.get(Self::FRAME_OFFSET),
-            frame_number: self.get(Self::FRAME_NO),
-        })
-    }
-
-    /// The result code, or `None` if this frame type's second word is fragment info.
-    ///
-    /// `Some(Err(raw))` when the SubDevice sent a value no `EOE_RESULT_*` defines - worth
-    /// reporting rather than discarding, and not a reason to fail decoding the header.
-    pub fn result(&self) -> Option<Result<EoeResult, u16>> {
+    /// See [`SecondWord`] for the three states and where each one comes from.
+    pub fn second_word(&self) -> SecondWord {
         use ethercrab_wire::EtherCrabWireRead as _;
 
-        self.carries_result().then(|| {
-            EoeResult::unpack_from_slice(&self.second_word.to_le_bytes())
-                .map_err(|_| self.second_word)
-        })
+        match self.frame_type {
+            FrameType::FragData => SecondWord::Fragment(Fragment {
+                number: self.get(Self::FRAGMENT_NO),
+                raw_offset: self.get(Self::FRAME_OFFSET),
+                frame_number: self.get(Self::FRAME_NO),
+            }),
+
+            FrameType::InitReq
+            | FrameType::GetIpParamReq
+            | FrameType::SetAddrFilterReq
+            | FrameType::GetAddrFilterReq => SecondWord::Unused,
+
+            FrameType::InitResp
+            | FrameType::InitRespTimestamp
+            | FrameType::SetAddrFilterResp
+            | FrameType::GetIpParamResp
+            | FrameType::GetAddrFilterResp => SecondWord::Result(
+                EoeResult::unpack_from_slice(&self.second_word.to_le_bytes())
+                    .map_err(|_| self.second_word),
+            ),
+        }
+    }
+
+    /// Fragment bookkeeping, or `None` if this frame carries none.
+    pub fn fragment(&self) -> Option<Fragment> {
+        match self.second_word() {
+            SecondWord::Fragment(fragment) => Some(fragment),
+            _ => None,
+        }
+    }
+
+    /// The result of the request this frame answers, or `None` if it answers none.
+    pub fn result(&self) -> Option<Result<EoeResult, u16>> {
+        match self.second_word() {
+            SecondWord::Result(result) => Some(result),
+            _ => None,
+        }
     }
 
     /// Set fragment number, offset-or-size and frame number.
@@ -223,7 +269,25 @@ impl EoeHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arbitrary::{Arbitrary, Unstructured};
     use ethercrab_wire::{EtherCrabWireRead, EtherCrabWireWrite};
+
+    // Manual impl because `port` is a special case: it is a `u8` in a four bit field, so
+    // an arbitrary value above 15 would be truncated on pack and the round trip could not
+    // hold. Same reason and same shape as `MailboxHeader`'s impl one directory up, whose
+    // `counter` is a `u8` in three bits.
+    impl<'a> Arbitrary<'a> for EoeHeader {
+        fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+            Ok(Self {
+                frame_type: Arbitrary::arbitrary(u)?,
+                port: u.choose_index(16)? as u8,
+                last_fragment: Arbitrary::arbitrary(u)?,
+                time_append: Arbitrary::arbitrary(u)?,
+                time_request: Arbitrary::arbitrary(u)?,
+                second_word: Arbitrary::arbitrary(u)?,
+            })
+        }
+    }
 
     /// A data fragment. Ported from `libs/SOEM/include/soem/ec_eoe.h`, EOE_HDR_* macros.
     ///
@@ -281,6 +345,70 @@ mod tests {
             None,
             "fragment zero starts at zero by definition"
         );
+    }
+
+    #[test]
+    fn every_frame_type_is_assigned_the_right_arm_of_the_union() {
+        // Two of the ten used to be pinned. The other eight let the discrimination be
+        // rewritten - "all *Resp carry a result", "everything but FragData" - without a
+        // single test noticing, and `NoFilterSupport` was unreachable because the address
+        // filter responses were on the fragment arm.
+        use FrameType::*;
+
+        for frame_type in [InitReq, GetIpParamReq, SetAddrFilterReq, GetAddrFilterReq] {
+            assert_eq!(
+                EoeHeader::new(frame_type, 0).second_word(),
+                SecondWord::Unused,
+                "{frame_type:?} is a request; ec_eoe.c writes zero and never reads it"
+            );
+        }
+
+        assert_eq!(
+            EoeHeader::new(FragData, 0).second_word(),
+            SecondWord::Fragment(Fragment {
+                number: 0,
+                raw_offset: 0,
+                frame_number: 0
+            }),
+            "only a data frame carries fragment bookkeeping"
+        );
+
+        for frame_type in [
+            InitResp,
+            InitRespTimestamp,
+            SetAddrFilterResp,
+            GetIpParamResp,
+            GetAddrFilterResp,
+        ] {
+            assert_eq!(
+                EoeHeader::new(frame_type, 0).second_word(),
+                SecondWord::Result(Ok(EoeResult::Success)),
+                "{frame_type:?} answers a request, so its second word is that answer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_address_filter_is_reachable() {
+        // `NoFilterSupport` can only ever arrive on an address filter response. If those
+        // sat on the fragment arm, the crate would define a result code its own accessor
+        // could never return. Bytes: type 5, result 0x0401.
+        let raw = [0x05, 0x00, 0x01, 0x04];
+        let header = EoeHeader::unpack_from_slice(&raw).expect("a header");
+
+        assert_eq!(header.result(), Some(Ok(EoeResult::NoFilterSupport)));
+        assert_eq!(header.fragment(), None);
+    }
+
+    #[test]
+    fn a_request_claims_no_frame_size() {
+        // The third state. With only two arms a request fell into the fragment one and
+        // cheerfully reported a zero byte frame.
+        let header = EoeHeader::new(FrameType::GetIpParamReq, 0);
+
+        assert_eq!(header.fragment(), None);
+        assert_eq!(header.result(), None);
+        assert_eq!(header.second_word(), SecondWord::Unused);
     }
 
     #[test]
@@ -465,5 +593,21 @@ mod tests {
             read_back.port, 0x0B,
             "the high nibble is dropped, not reported"
         );
+    }
+
+    #[test]
+    fn eoe_header_fuzz() {
+        // The convention every other wire type in this crate follows. The fixed byte
+        // sequences above pin one value per field; this covers the rest of the space.
+        heckcheck::check(|header: EoeHeader| {
+            let mut packed = [0u8; 4];
+            header.pack_to_slice(&mut packed).expect("Pack");
+
+            let unpacked = EoeHeader::unpack_from_slice(&packed).expect("Unpack");
+
+            pretty_assertions::assert_eq!(header, unpacked);
+
+            Ok(())
+        });
     }
 }

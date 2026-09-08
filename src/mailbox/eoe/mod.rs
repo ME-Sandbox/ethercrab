@@ -791,14 +791,14 @@ pub enum ReassemblyError {
     },
     /// A fragment arrived for a different port of the SubDevice.
     ///
-    /// Two ports fragmenting at the same time would otherwise splice into one frame, half
-    /// of each: both start at frame number zero, so fragment number, frame number and
+    /// Two ports fragmenting at the same time can otherwise splice into one frame, half of
+    /// each: if their frame numbers happen to agree, fragment number, frame number and
     /// offset all line up and the halves fit together without a complaint.
     ///
-    /// Checked on **every** fragment, not only on fragment zero as `ec_eoe.c:487` does.
-    /// Once is enough there because `ecx_EOErecv` is a blocking loop over one mailbox and
-    /// one port, so the routing is guaranteed by the call. This is push driven and cannot
-    /// assume it.
+    /// Checked on **every** fragment. The reference implementation checks it once, on
+    /// fragment zero (`ec_eoe.c:487`), which leaves the same gap from fragment one onward -
+    /// its `port` argument says which port the caller *wants*, not which one the arriving
+    /// fragments carry.
     WrongPort {
         /// The port this reassembly is for.
         expected: u8,
@@ -943,12 +943,7 @@ impl<'buf> Reassembly<'buf> {
             });
         };
 
-        // Every fragment, not only fragment zero. The reference implementation checks it
-        // once (`ec_eoe.c:487`), which is enough only when the caller already routes
-        // fragments to the right reassembly. Checking each one makes the guard hold on its
-        // own: two ports fragmenting at the same time both start at frame number zero, so
-        // fragment number, frame number and offset all line up and the halves splice into
-        // one frame without a single error.
+        // Every fragment, not only fragment zero - see `ReassemblyError::WrongPort`.
         if header.port != self.port {
             return Err(ReassemblyError::WrongPort {
                 expected: self.port,
@@ -1792,6 +1787,12 @@ mod fragment_tests {
             Fragments::new(&[0u8; 4], 64, 0, 15).is_ok(),
             "15 still fits"
         );
+        // The first rejected value. Without it a five bit limit passes: port 16 is
+        // accepted and then packs to port 0 on the wire.
+        assert_eq!(
+            Fragments::new(&[0u8; 4], 64, 0, 16).unwrap_err(),
+            FragmentError::PortTooWide { port: 16 }
+        );
     }
 
     #[test]
@@ -2333,10 +2334,6 @@ mod reassembly_tests {
         // five bit limit, port 16 is accepted here and then packs to port 0 on the wire.
         assert_eq!(
             Reassembly::new(&mut buffer, 16).unwrap_err(),
-            FragmentError::PortTooWide { port: 16 }
-        );
-        assert_eq!(
-            Fragments::new(&[0u8; 4], 64, 0, 16).unwrap_err(),
             FragmentError::PortTooWide { port: 16 }
         );
     }

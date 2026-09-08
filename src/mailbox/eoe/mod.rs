@@ -5,8 +5,9 @@
 //! rather than read off a description of the protocol.
 
 use crate::fmt;
+use crate::mailbox::{MailboxHeader, MailboxType, Priority};
 use core::net::Ipv4Addr;
-use ethercrab_wire::{EtherCrabWireRead, EtherCrabWireWrite, WireError};
+use ethercrab_wire::{EtherCrabWireRead, EtherCrabWireSized, EtherCrabWireWrite, WireError};
 
 /// EoE frame type, the low four bits of the first header word.
 ///
@@ -1136,6 +1137,58 @@ impl<'buf> Reassembly<'buf> {
             self.buffer.get(..length)
         )))
     }
+}
+
+/// Builds the mailbox payload for one EoE fragment.
+///
+/// Ported from `ecx_EOEsend` (`ec_eoe.c:396-404`): a mailbox header whose length counts the
+/// EoE header plus the fragment data, then the two EoE header words, then the data.
+///
+/// ```text
+/// [ mailbox header 6 ][ EoE header 4 ][ fragment data ... ]
+///                ^--- length = 4 + data.len()
+/// ```
+///
+/// Pure, so the byte layout is testable without a bus. `buffer` is the mailbox sized
+/// scratch the caller writes from.
+///
+/// # Errors
+///
+/// [`WireError::WriteBufferTooShort`] if `buffer` cannot hold the two headers and the data.
+pub fn write_fragment<'buf>(
+    buffer: &'buf mut [u8],
+    counter: u8,
+    header: EoeHeader,
+    data: &[u8],
+) -> Result<&'buf [u8], WireError> {
+    let length = EoeHeader::PACKED_LEN + data.len();
+    let total = MailboxHeader::PACKED_LEN + length;
+
+    let used = buffer
+        .get_mut(..total)
+        .ok_or(WireError::WriteBufferTooShort)?;
+
+    let mailbox = MailboxHeader {
+        // `ecx_EOEsend` writes `4 + txframesize` - the EoE header plus the data, not the
+        // mailbox header. Counting the mailbox header too would make the SubDevice read
+        // six bytes past the frame.
+        length: u16::try_from(length).map_err(|_| WireError::WriteBufferTooShort)?,
+        priority: Priority::Lowest,
+        mailbox_type: MailboxType::Eoe,
+        counter,
+    };
+
+    let after_mailbox = mailbox.pack_to_slice(used)?.len();
+    let rest = used
+        .get_mut(after_mailbox..)
+        .ok_or(WireError::WriteBufferTooShort)?;
+
+    let after_header = header.pack_to_slice(rest)?.len();
+    rest.get_mut(after_header..)
+        .ok_or(WireError::WriteBufferTooShort)?
+        .copy_from_slice(data);
+
+    Ok(used)
 }
 
 #[cfg(test)]
@@ -2592,5 +2645,123 @@ mod reassembly_tests {
                 frame_type: FrameType::InitResp
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod mailbox_tests {
+    use super::*;
+
+    #[test]
+    fn one_fragment_becomes_the_bytes_the_c_source_would_send() {
+        // `ecx_EOEsend` (`ec_eoe.c:396-404`):
+        //   mbxheader.length  = 4 + txframesize        -> 4 + 8 = 12 = 0x000C
+        //   mbxheader.mbxtype = ECT_MBXT_EOE + count   -> type 2, counter 3
+        //   frameinfo1, frameinfo2, then the data
+        //
+        // The mailbox header is six bytes: length(2), address(2, always zero here),
+        // then priority(2 bits) and type(4) and counter(3) packed into the last two.
+        let header = EoeHeader::new(FrameType::FragData, 0).with_fragment(0, 1, 0);
+
+        let mut buffer = [0xAAu8; 64];
+        let written = write_fragment(&mut buffer, 3, header, b"eight by").expect("room");
+
+        assert_eq!(written.len(), 6 + 4 + 8);
+        assert_eq!(
+            &written[0..2],
+            &[0x0C, 0x00],
+            "length counts EoE header plus data"
+        );
+        // frameinfo2 = FRAME_OFFSET_SET(1) = (1 & 0x3F) << 6 = 0x0040, little-endian.
+        assert_eq!(
+            &written[6..10],
+            &[0x00, 0x00, 0x40, 0x00],
+            "the two EoE words"
+        );
+        assert_eq!(&written[10..], b"eight by");
+    }
+
+    #[test]
+    fn the_length_does_not_count_the_mailbox_header() {
+        // Counting it too would make the SubDevice read six bytes past the frame.
+        let header = EoeHeader::new(FrameType::FragData, 0);
+
+        for data in [&b""[..], &b"x"[..], &[0u8; 32][..]] {
+            let mut buffer = [0u8; 64];
+            let written = write_fragment(&mut buffer, 1, header, data).expect("room");
+
+            let length = u16::from_le_bytes([written[0], written[1]]);
+            assert_eq!(
+                usize::from(length),
+                4 + data.len(),
+                "for {} bytes of data",
+                data.len()
+            );
+            assert_eq!(written.len(), 6 + usize::from(length));
+        }
+    }
+
+    #[test]
+    fn the_mailbox_header_says_eoe_and_carries_the_counter() {
+        let header = EoeHeader::new(FrameType::FragData, 0);
+        let mut buffer = [0u8; 32];
+        let written = write_fragment(&mut buffer, 5, header, b"").expect("room");
+
+        let mailbox = MailboxHeader::unpack_from_slice(&written[..6]).expect("a header");
+
+        assert_eq!(mailbox.mailbox_type, MailboxType::Eoe);
+        assert_eq!(mailbox.counter, 5);
+        assert_eq!(mailbox.priority, Priority::Lowest);
+        assert_eq!(mailbox.length, 4);
+    }
+
+    #[test]
+    fn the_eoe_header_survives_the_round_trip() {
+        let header = EoeHeader::new(FrameType::FragData, 2).with_fragment(3, 4, 5);
+        let mut buffer = [0u8; 32];
+        let written = write_fragment(&mut buffer, 1, header, b"data").expect("room");
+
+        assert_eq!(
+            EoeHeader::unpack_from_slice(&written[6..10]),
+            Ok(header),
+            "wrote {:02x?}",
+            written
+        );
+    }
+
+    #[test]
+    fn a_buffer_too_small_is_an_error_and_not_a_panic() {
+        let header = EoeHeader::new(FrameType::FragData, 0);
+
+        // Ten bytes hold both headers and nothing else.
+        let mut exact = [0u8; 10];
+        assert!(write_fragment(&mut exact, 1, header, b"").is_ok());
+        assert_eq!(
+            write_fragment(&mut exact, 1, header, b"x"),
+            Err(WireError::WriteBufferTooShort)
+        );
+
+        let mut nothing = [0u8; 0];
+        assert!(write_fragment(&mut nothing, 1, header, b"").is_err());
+    }
+
+    #[test]
+    fn a_whole_frame_goes_out_as_a_sequence_of_mailboxes() {
+        // What the send path will do: split, then write each fragment. The mailbox
+        // capacity is the mailbox size less both headers.
+        const MAILBOX: usize = 128;
+        let frame: Vec<u8> = (0..=255u8).cycle().take(250).collect();
+
+        let mut rejoined = Vec::new();
+
+        for (header, data) in Fragments::new(&frame, MAILBOX - 6 - 4, 0, 0).expect("fits") {
+            let mut buffer = [0u8; MAILBOX];
+            let written = write_fragment(&mut buffer, 1, header, data).expect("room");
+
+            assert!(written.len() <= MAILBOX, "a fragment must fit its mailbox");
+            rejoined.extend_from_slice(&written[10..]);
+        }
+
+        assert_eq!(rejoined, frame);
     }
 }

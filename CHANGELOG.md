@@ -51,6 +51,10 @@ A pure Rust EtherCAT MainDevice supporting std and no_std environments.
   wait, so the caller decides when to give up - and is told what it gave up on.
   `Reassembly::port` names the port a reassembly belongs to.
 
+  `write_fragment` builds the mailbox payload for one fragment: the mailbox header, the
+  EoE header and the data. Its length field counts the EoE header and the data but *not*
+  the mailbox header, as `ecx_EOEsend` writes it.
+
 ## [0.7.1] - 2026-03-23
 
 ### Fixed

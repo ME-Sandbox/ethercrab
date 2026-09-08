@@ -398,18 +398,14 @@ impl EtherCrabWireWrite for IpParam {
         let mut at = Self::FIELDS_START;
 
         for ((flag, width), field) in self.present() {
-            let bytes = match field {
-                Field::Bytes(bytes) => {
-                    buffer[at..at + bytes.len()].copy_from_slice(bytes);
-                    bytes.len()
-                }
+            match field {
+                Field::Bytes(bytes) => buffer[at..at + bytes.len()].copy_from_slice(bytes),
                 Field::Address(address) => {
                     let [a, b, c, d] = address.octets();
                     // Last octet first - see the note on `IpParam`.
                     buffer[at..at + 4].copy_from_slice(&[d, c, b, a]);
-                    4
                 }
-            };
+            }
 
             // No check that `bytes <= width`: both sources are bounded by their type -
             // a `[u8; 6]` MAC and a `heapless::String<32>` name against a 32 wide slot.

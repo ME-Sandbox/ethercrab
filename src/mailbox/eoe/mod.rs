@@ -592,6 +592,7 @@ impl std::error::Error for FragmentError {}
 ///
 /// Pure: it borrows the frame and yields headers and slices of it, and does no I/O.
 #[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Fragments<'a> {
     frame: &'a [u8],
     /// Bytes of EoE payload one mailbox can carry: `mbx_l - 0x0A` (`ec_eoe.c:344`).
@@ -615,9 +616,6 @@ impl<'a> Fragments<'a> {
 
     /// The longest frame whose size and offsets both fit the six bit field.
     pub const MAX_FRAME: usize = Self::MAX_BLOCKS * Self::BLOCK;
-
-    /// The port is a four bit field.
-    const MAX_NIBBLE: u8 = MAX_PORT;
 
     /// Prepares to split `frame` for a mailbox that can carry `capacity` bytes of EoE
     /// payload.
@@ -644,7 +642,7 @@ impl<'a> Fragments<'a> {
         frame_number: u8,
         port: u8,
     ) -> Result<Self, FragmentError> {
-        if port > Self::MAX_NIBBLE {
+        if port > MAX_PORT {
             return Err(FragmentError::PortTooWide { port });
         }
 
@@ -794,8 +792,13 @@ pub enum ReassemblyError {
     /// A fragment arrived for a different port of the SubDevice.
     ///
     /// Two ports fragmenting at the same time would otherwise splice into one frame, half
-    /// of each. Checked on **every** fragment, not only on fragment zero as `ec_eoe.c:487`
-    /// does - see [`Reassembly`] for why once is not enough here.
+    /// of each: both start at frame number zero, so fragment number, frame number and
+    /// offset all line up and the halves fit together without a complaint.
+    ///
+    /// Checked on **every** fragment, not only on fragment zero as `ec_eoe.c:487` does.
+    /// Once is enough there because `ecx_EOErecv` is a blocking loop over one mailbox and
+    /// one port, so the routing is guaranteed by the call. This is push driven and cannot
+    /// assume it.
     WrongPort {
         /// The port this reassembly is for.
         expected: u8,
@@ -1020,14 +1023,9 @@ impl<'buf> Reassembly<'buf> {
             });
         }
 
-        // `end <= announced <= buffer.len()`, both checked above.
-        self.buffer
-            .get_mut(partial.filled..end)
-            .ok_or(ReassemblyError::Overrun {
-                announced: partial.announced,
-                would_be: end,
-            })?
-            .copy_from_slice(data);
+        // `end <= announced <= buffer.len()`, both checked above - the same reasoning as
+        // at the end of this function, and the same crate idiom for it.
+        fmt::unwrap_opt!(self.buffer.get_mut(partial.filled..end)).copy_from_slice(data);
 
         partial.filled = end;
         partial.next_fragment += 1;
@@ -2289,6 +2287,34 @@ mod reassembly_tests {
     }
 
     #[test]
+    fn a_reassembly_for_a_port_other_than_zero_accepts_its_own_traffic() {
+        // Every other test here uses port 0, which makes `header.port != self.port`
+        // indistinguishable from `header.port != 0`. With that mistake a reassembly for
+        // port 1 rejects its own fragments and lets port 0's straight in - the very splice
+        // the check exists to stop, inverted.
+        let frame = [0x5Au8; 250];
+        let mut buffer = [0u8; 512];
+        let mut reassembly = Reassembly::new(&mut buffer, 1).expect("a real port");
+
+        let ours: Vec<_> = Fragments::new(&frame, 118, 0, 1)
+            .expect("fits")
+            .map(|(header, data)| (header, data.to_vec()))
+            .collect();
+
+        assert_eq!(feed(&mut reassembly, &ours), Some(frame.to_vec()));
+
+        // And port 0 is now the foreign one.
+        let stranger = EoeHeader::new(FrameType::FragData, 0).with_fragment(0, 8, 0);
+        assert_eq!(
+            reassembly.push(stranger, &[0u8; 96]),
+            Err(ReassemblyError::WrongPort {
+                expected: 1,
+                received: 0
+            })
+        );
+    }
+
+    #[test]
     fn a_reassembly_for_a_port_that_cannot_exist_is_refused() {
         let mut buffer = [0u8; 64];
 
@@ -2302,6 +2328,16 @@ mod reassembly_tests {
         assert!(
             Reassembly::new(&mut buffer, 15).is_ok(),
             "15 is a real port"
+        );
+        // The first rejected value, which neither this test nor its twin covered: with a
+        // five bit limit, port 16 is accepted here and then packs to port 0 on the wire.
+        assert_eq!(
+            Reassembly::new(&mut buffer, 16).unwrap_err(),
+            FragmentError::PortTooWide { port: 16 }
+        );
+        assert_eq!(
+            Fragments::new(&[0u8; 4], 64, 0, 16).unwrap_err(),
+            FragmentError::PortTooWide { port: 16 }
         );
     }
 

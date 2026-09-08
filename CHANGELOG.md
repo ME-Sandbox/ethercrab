@@ -58,6 +58,15 @@ A pure Rust EtherCAT MainDevice supporting std and no_std environments.
   header, the EoE header and the data. Its length field counts the EoE header and the data
   but *not* the mailbox header, as `ecx_EOEsend` writes it.
 
+  `Reassembly::into_buffer` hands the buffer back, for a caller that assembled a frame and
+  wants to go on using the memory.
+
+- `MailboxError::UnexpectedProtocol` reports a mailbox holding a protocol other than the
+  one being read. One mailbox carries every protocol a SubDevice supports, so a CoE
+  response can arrive while an EoE fragment is expected. It carries the raw mailbox type
+  nibble rather than a decoded type, because a value this crate does not know is exactly
+  the case worth reporting.
+
 ### Fixed
 
 - `WrappedWrite::with_len` is now honoured by `send_receive` and `send_receive_slice` as

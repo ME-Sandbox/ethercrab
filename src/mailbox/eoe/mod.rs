@@ -970,6 +970,15 @@ impl<'buf> Reassembly<'buf> {
         })
     }
 
+    /// Gives the buffer back.
+    ///
+    /// Any half assembled frame in it is abandoned - use [`in_progress`](Self::in_progress)
+    /// first if that matters. The bytes are left as they are rather than cleared, so what
+    /// the caller reads back is whatever arrived.
+    pub fn into_buffer(self) -> &'buf mut [u8] {
+        self.buffer
+    }
+
     /// The port this reassembly is for.
     ///
     /// Nothing here needs it - it is for a caller holding one reassembly per port that
@@ -2960,7 +2969,132 @@ mod mailbox_tests {
     }
 }
 
-/// The asynchronous half of the send path, against a loopback "SubDevice".
+/// Feeds one received mailbox to a [`Reassembly`].
+///
+/// Ported from `ecx_EOEreadfragment` (`ec_eoe.c:559-660`) and the body of `ecx_EOErecv`'s
+/// loop (`:459-534`). `payload` is the whole mailbox as it was read: a six byte mailbox
+/// header, four bytes of EoE header, and the fragment.
+///
+/// This exists next to [`receive_frame`] for the same reason the reference has both: the
+/// loop owns the mailbox and blocks until a whole frame has arrived, while this one takes
+/// a mailbox somebody else read and is therefore the piece a demultiplexing receive pump
+/// can use. It also makes every rule below testable without a bus.
+///
+/// The **length comes from the mailbox header, not from the PDU**. A mailbox read returns
+/// the whole mailbox - `read_mailbox.len` bytes, whatever the SubDevice put in it - so the
+/// bytes past the header's `length` are the previous message, or nothing at all.
+/// `ec_eoe.c:463` computes `mbxheader.length - 4` for exactly this reason.
+///
+/// # Errors
+///
+/// [`Error::Mailbox`] with [`MailboxError::UnexpectedProtocol`] if the mailbox holds
+/// something that is not EoE - one mailbox carries every protocol a SubDevice supports, so
+/// a CoE response can arrive while an EoE fragment is expected.
+///
+/// [`Error::Mailbox`] with [`MailboxError::TooLong`] if the header's length does not fit
+/// the bytes that were read, or is under the four bytes an EoE header alone needs.
+///
+/// [`Error::Reassembly`] for a fragment the reassembly refuses, and [`Error::Wire`] for a
+/// header that does not decode.
+#[allow(dead_code)]
+pub(crate) fn push_mailbox<'buf>(
+    reassembly: &'buf mut Reassembly<'_>,
+    payload: &[u8],
+) -> Result<Reassembled<'buf>, Error> {
+    let mailbox = MailboxHeader::unpack_from_slice(payload)?;
+
+    // `(mbxtype & 0x0f) == ECT_MBXT_EOE` (`ec_eoe.c:461`), and anything else is
+    // `EC_ERR_TYPE_PACKET_ERROR` (`:538`). The nibble is already decoded by the wire
+    // derive, so an unknown one fails there rather than here.
+    if mailbox.mailbox_type != MailboxType::Eoe {
+        return Err(Error::Mailbox(MailboxError::UnexpectedProtocol {
+            received: mailbox.mailbox_type as u8,
+        }));
+    }
+
+    let length = usize::from(mailbox.length);
+
+    // `eoedatasize = length - 4` (`ec_eoe.c:463`), which underflows there for a length
+    // under four. The reference then hands `memcpy` a huge size; here it is an error.
+    let announced = payload
+        .get(MailboxHeader::PACKED_LEN..MailboxHeader::PACKED_LEN + length)
+        .filter(|body| body.len() >= EoeHeader::PACKED_LEN)
+        .ok_or(Error::Mailbox(MailboxError::TooLong {
+            address: 0,
+            sub_index: 0,
+        }))?;
+
+    let header = EoeHeader::unpack_from_slice(announced)?;
+
+    Ok(reassembly.push(header, &announced[EoeHeader::PACKED_LEN..])?)
+}
+
+/// Reads one Ethernet frame out of a SubDevice's EoE port, fragment by fragment.
+///
+/// Ported from `ecx_EOErecv` (`ec_eoe.c:437-543`): read the OUT mailbox, feed the fragment
+/// to a reassembly over `buffer`, and go round again until one of them is the last.
+///
+/// The reassembly is **built and dropped inside this call**, which is the reference
+/// implementation's own shape - `ecx_EOErecv` keeps its four state variables as locals
+/// (`ec_eoe.c:441-452`). A frame is whole when this returns, so there is nothing to carry
+/// over; a caller that wants to keep a half assembled frame across a timeout holds its own
+/// [`Reassembly`] and feeds it with [`push_mailbox`].
+///
+/// **This owns the mailbox while it runs.** One mailbox carries every protocol a SubDevice
+/// supports, so a CoE response arriving mid-frame is read here and reported as
+/// [`MailboxError::UnexpectedProtocol`] rather than handed to whoever was waiting for it.
+/// That is the reference implementation's own shape - `ecx_EOErecv` calls `ecx_mbxreceive`
+/// directly - and it is why SOEM grows a mailbox handler
+/// (`ecx_mbxhandler`, `ec_main.c:1507`) for anyone who needs both at once. Sorting the
+/// protocols apart belongs to that pump, not here.
+///
+/// # Errors
+///
+/// [`Error::Mailbox`] with [`MailboxError::NoWriteMailbox`] if the SubDevice has no read
+/// mailbox - the pairing is upstream's, see the note in [`wait_for_mailboxes`].
+///
+/// Otherwise whatever [`push_mailbox`] reports, and [`Error::Timeout`] if a fragment does
+/// not arrive within
+/// [`Timeouts::mailbox_response`](crate::Timeouts::mailbox_response).
+#[allow(dead_code)]
+pub(crate) async fn receive_frame<'buf, S>(
+    subdevice: &SubDeviceRef<'_, S>,
+    port: u8,
+    buffer: &'buf mut [u8],
+) -> Result<&'buf [u8], Error>
+where
+    S: Deref<Target = SubDevice>,
+{
+    let read_mailbox = subdevice
+        .config
+        .mailbox
+        .read
+        .ok_or(Error::Mailbox(MailboxError::NoWriteMailbox))?;
+
+    let mut reassembly = Reassembly::new(buffer, port)?;
+    let length;
+
+    loop {
+        let response = crate::mailbox::wait_for_mailbox_response(subdevice, &read_mailbox).await?;
+
+        // Only the length crosses the end of the borrow, not the slice. Returning the
+        // frame straight out of the loop is what a reader writes first, and borrowck
+        // rejects it: the borrow would have to live as long as the buffer, and the path
+        // that goes round again needs another one.
+        if let Reassembled::Frame(frame) = push_mailbox(&mut reassembly, &response)? {
+            length = frame.len();
+
+            break;
+        }
+    }
+
+    let buffer = reassembly.into_buffer();
+
+    // `length` came from a slice of this very buffer one statement ago.
+    Ok(fmt::unwrap_opt!(buffer.get(..length)))
+}
+
+/// The asynchronous halves of both mailbox paths, against a loopback "SubDevice".
 ///
 /// There is no bus here and no recorded capture. Every frame the PDU loop sends is handed
 /// straight back to it, which is all a SubDevice has to do for this loop: answer the sync
@@ -2968,7 +3102,7 @@ mod mailbox_tests {
 /// with a working counter. What the loop wrote is kept on the way past, so the assertions
 /// are about the bytes that would have gone on a wire.
 #[cfg(test)]
-mod send_tests {
+mod mailbox_path_tests {
     use super::*;
     use crate::{
         MainDevice, MainDeviceConfig, PduStorage, SubDevice, SubDeviceRef, Timeouts,
@@ -3072,10 +3206,28 @@ mod send_tests {
         /// `wkc_for_write(n)` is the working counter the fake SubDevice answers the `n`th
         /// mailbox write with, counting from zero. Everything else is answered with 1.
         fn start(
+            tx: PduTx<'static>,
+            rx: PduRx<'static>,
+            wkc_for_write: impl Fn(usize) -> u16 + Send + 'static,
+        ) -> Self {
+            Self::start_serving(tx, rx, wkc_for_write, Vec::new())
+        }
+
+        /// As [`start`](Self::start), plus a queue of mailbox contents the SubDevice hands
+        /// out, one per read of its OUT mailbox, in order.
+        ///
+        /// Each entry is a whole mailbox as it would sit in the SubDevice: mailbox header,
+        /// EoE header, fragment. They are padded to the mailbox length on the way out,
+        /// because that is what a read of a mailbox returns - which is the reason the
+        /// receive path has to take its length from the header rather than from what it
+        /// read.
+        fn start_serving(
             mut tx: PduTx<'static>,
             mut rx: PduRx<'static>,
             wkc_for_write: impl Fn(usize) -> u16 + Send + 'static,
+            to_read: Vec<Vec<u8>>,
         ) -> Self {
+            let mut to_read = to_read.into_iter();
             let (net_tx, net_rx) = mpsc::sync_channel::<Vec<u8>>(16);
 
             let written = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -3126,6 +3278,17 @@ mod send_tests {
                             }
                             FPRD => {
                                 read_rx.lock().expect("Poisoned").push(register);
+
+                                // A read of the OUT mailbox itself: hand out the next
+                                // queued message, padded with the 0xAA the mailbox is
+                                // filled with here, so a receive path that trusts the PDU
+                                // length instead of the header's reads filler.
+                                if register == READ_MAILBOX_ADDRESS {
+                                    let message = to_read.next().expect("A queued mailbox");
+
+                                    data.fill(0xAA);
+                                    data[..message.len()].copy_from_slice(&message);
+                                }
 
                                 1
                             }
@@ -3458,6 +3621,242 @@ mod send_tests {
         assert_eq!(
             send_frame(&subdevice_ref, PORT, &[]).await,
             Err(Error::Mailbox(MailboxError::NoReadMailbox))
+        );
+    }
+
+    /// One mailbox as a SubDevice would hold it, built the way the send path builds one.
+    fn mailbox_holding(header: EoeHeader, counter: u8, data: &[u8]) -> Vec<u8> {
+        let mut buffer = vec![0u8; 6 + 4 + data.len()];
+
+        header
+            .write_fragment(&mut buffer, counter, data)
+            .expect("Room");
+
+        buffer
+    }
+
+    #[test]
+    fn the_length_of_a_fragment_comes_from_the_mailbox_header() {
+        // A mailbox read returns the whole mailbox, so everything past the header's length
+        // is the previous message or was never written. Taking the length from what was
+        // read would append that filler to the frame.
+        let mut buffer = [0u8; 64];
+        let mut reassembly = Reassembly::new(&mut buffer, PORT).expect("A reassembly");
+
+        let header = EoeHeader {
+            last_fragment: true,
+            ..EoeHeader::new(FrameType::FragData, PORT).with_fragment(0, 1, 1)
+        };
+
+        let mut mailbox = mailbox_holding(header, 1, b"four");
+        mailbox.extend_from_slice(&[0xAA; 20]);
+
+        assert_eq!(
+            push_mailbox(&mut reassembly, &mailbox).expect("A fragment"),
+            Reassembled::Frame(b"four")
+        );
+    }
+
+    #[test]
+    fn a_mailbox_that_is_not_eoe_is_refused() {
+        let mut buffer = [0u8; 64];
+        let mut reassembly = Reassembly::new(&mut buffer, PORT).expect("A reassembly");
+
+        // A CoE response, which shares the mailbox with EoE and can arrive at any time.
+        let mut mailbox = mailbox_holding(
+            EoeHeader {
+                last_fragment: true,
+                ..EoeHeader::new(FrameType::FragData, PORT).with_fragment(0, 1, 1)
+            },
+            1,
+            b"four",
+        );
+        mailbox[5] = (mailbox[5] & 0xF0) | MailboxType::Coe as u8;
+
+        assert_eq!(
+            push_mailbox(&mut reassembly, &mailbox),
+            Err(Error::Mailbox(MailboxError::UnexpectedProtocol {
+                received: MailboxType::Coe as u8
+            }))
+        );
+    }
+
+    #[test]
+    fn a_length_that_cannot_hold_an_eoe_header_is_refused() {
+        // `eoedatasize = length - 4` (`ec_eoe.c:463`) underflows for a length under four,
+        // and the reference then hands `memcpy` a size near `SIZE_MAX`.
+        let mut buffer = [0u8; 64];
+        let mut reassembly = Reassembly::new(&mut buffer, PORT).expect("A reassembly");
+
+        for length in [0u16, 1, 3] {
+            let mut mailbox = mailbox_holding(
+                EoeHeader::new(FrameType::FragData, PORT).with_fragment(0, 0, 1),
+                1,
+                b"four",
+            );
+            mailbox[0..2].copy_from_slice(&length.to_le_bytes());
+
+            assert_eq!(
+                push_mailbox(&mut reassembly, &mailbox),
+                Err(Error::Mailbox(MailboxError::TooLong {
+                    address: 0,
+                    sub_index: 0
+                })),
+                "a mailbox announcing {} bytes",
+                length
+            );
+        }
+    }
+
+    #[test]
+    fn a_length_longer_than_what_arrived_is_refused() {
+        let mut buffer = [0u8; 64];
+        let mut reassembly = Reassembly::new(&mut buffer, PORT).expect("A reassembly");
+
+        let mut mailbox = mailbox_holding(
+            EoeHeader {
+                last_fragment: true,
+                ..EoeHeader::new(FrameType::FragData, PORT).with_fragment(0, 1, 1)
+            },
+            1,
+            b"four",
+        );
+        // Eight bytes of payload announced, six delivered.
+        mailbox[0..2].copy_from_slice(&12u16.to_le_bytes());
+
+        assert_eq!(
+            push_mailbox(&mut reassembly, &mailbox),
+            Err(Error::Mailbox(MailboxError::TooLong {
+                address: 0,
+                sub_index: 0
+            }))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_frame_is_read_back_fragment_by_fragment() {
+        const MAX_FRAMES: usize = 16;
+        const MAX_PDU_DATA: usize = PduStorage::element_size(128);
+
+        static PDU_STORAGE: PduStorage<MAX_FRAMES, MAX_PDU_DATA> = PduStorage::new();
+
+        crate::test_logger();
+
+        let (tx, rx, pdu_loop) = PDU_STORAGE.try_split().expect("can only split once");
+
+        // The same 70 bytes the send test writes, cut the same way, handed back one
+        // mailbox at a time.
+        let frame = (0..70u8).collect::<Vec<_>>();
+
+        let mailboxes = Fragments::new(&frame, CAPACITY, 1, PORT)
+            .expect("Fits")
+            .enumerate()
+            .map(|(index, (header, data))| mailbox_holding(header, index as u8 + 1, data))
+            .collect::<Vec<_>>();
+
+        assert_eq!(mailboxes.len(), 3, "the fixture is a three fragment frame");
+
+        let net = Loopback::start_serving(tx, rx, |_| 1, mailboxes);
+
+        let maindevice = MainDevice::new(pdu_loop, timeouts(), MainDeviceConfig::default());
+
+        let subdevice = subdevice_with_mailbox(MAILBOX_LEN);
+        let subdevice_ref = SubDeviceRef::new(&maindevice, CONFIGURED_ADDRESS, &subdevice);
+
+        let mut buffer = [0u8; 128];
+
+        let result = receive_frame(&subdevice_ref, PORT, &mut buffer)
+            .await
+            .map(<[u8]>::to_vec);
+
+        let (written, read) = net.finish();
+
+        assert_eq!(result.as_deref(), Ok(frame.as_slice()));
+
+        assert!(
+            written.is_empty(),
+            "a receive writes nothing to the SubDevice"
+        );
+        assert!(
+            read.contains(&READ_MAILBOX_ADDRESS),
+            "the OUT mailbox is what a receive reads: {:#06x?}",
+            read
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn another_protocol_arriving_mid_frame_is_reported() {
+        const MAX_FRAMES: usize = 16;
+        const MAX_PDU_DATA: usize = PduStorage::element_size(128);
+
+        static PDU_STORAGE: PduStorage<MAX_FRAMES, MAX_PDU_DATA> = PduStorage::new();
+
+        crate::test_logger();
+
+        let (tx, rx, pdu_loop) = PDU_STORAGE.try_split().expect("can only split once");
+
+        let frame = (0..70u8).collect::<Vec<_>>();
+
+        let mut mailboxes = Fragments::new(&frame, CAPACITY, 1, PORT)
+            .expect("Fits")
+            .enumerate()
+            .map(|(index, (header, data))| mailbox_holding(header, index as u8 + 1, data))
+            .collect::<Vec<_>>();
+
+        // A CoE response lands between the first and second fragment, which is what one
+        // mailbox for every protocol means in practice.
+        mailboxes[1][5] = (mailboxes[1][5] & 0xF0) | MailboxType::Coe as u8;
+
+        let net = Loopback::start_serving(tx, rx, |_| 1, mailboxes);
+
+        let maindevice = MainDevice::new(pdu_loop, timeouts(), MainDeviceConfig::default());
+
+        let subdevice = subdevice_with_mailbox(MAILBOX_LEN);
+        let subdevice_ref = SubDeviceRef::new(&maindevice, CONFIGURED_ADDRESS, &subdevice);
+
+        let mut buffer = [0u8; 128];
+
+        let result = receive_frame(&subdevice_ref, PORT, &mut buffer)
+            .await
+            .map(<[u8]>::to_vec);
+
+        net.finish();
+
+        assert_eq!(
+            result,
+            Err(Error::Mailbox(MailboxError::UnexpectedProtocol {
+                received: MailboxType::Coe as u8
+            })),
+            "it is reported, not skipped - sorting the protocols apart is a pump's job"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subdevice_without_a_read_mailbox_cannot_be_received_from() {
+        const MAX_FRAMES: usize = 2;
+        const MAX_PDU_DATA: usize = PduStorage::element_size(64);
+
+        static PDU_STORAGE: PduStorage<MAX_FRAMES, MAX_PDU_DATA> = PduStorage::new();
+
+        crate::test_logger();
+
+        let (_tx, _rx, pdu_loop) = PDU_STORAGE.try_split().expect("can only split once");
+
+        let maindevice =
+            MainDevice::new(pdu_loop, Timeouts::default(), MainDeviceConfig::default());
+
+        let mut subdevice = subdevice_with_mailbox(MAILBOX_LEN);
+        subdevice.config.mailbox.read = None;
+
+        let subdevice_ref = SubDeviceRef::new(&maindevice, CONFIGURED_ADDRESS, &subdevice);
+
+        let mut buffer = [0u8; 64];
+
+        // `NoWriteMailbox` for a missing *read* mailbox: upstream's pairing again, the
+        // mirror image of the one the send path uses.
+        assert_eq!(
+            receive_frame(&subdevice_ref, PORT, &mut buffer).await,
+            Err(Error::Mailbox(MailboxError::NoWriteMailbox))
         );
     }
 

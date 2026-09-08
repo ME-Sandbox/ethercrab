@@ -294,6 +294,20 @@ pub enum MailboxError {
         /// Error register.
         error_register: u8,
     },
+    /// The mailbox held a different protocol than the one being read.
+    ///
+    /// The reference implementation answers this with `EC_ERR_TYPE_PACKET_ERROR`
+    /// (`ec_eoe.c:538`). One mailbox carries every protocol a SubDevice supports, so a CoE
+    /// response can turn up while an EoE fragment is expected.
+    UnexpectedProtocol {
+        /// The mailbox type nibble that arrived, ETG1000.6 Table 29: 1 AoE, 2 EoE, 3 CoE,
+        /// 4 FoE, 5 SoE, 15 vendor specific.
+        ///
+        /// The raw value rather than the `MailboxType` it decodes to, because that type is
+        /// crate-internal - and because a nibble this crate does not know is exactly the
+        /// case worth reporting.
+        received: u8,
+    },
 }
 
 impl core::fmt::Display for MailboxError {
@@ -326,6 +340,11 @@ impl core::fmt::Display for MailboxError {
                 f,
                 "emergency: code {:#06x}, register {:#04x}",
                 error_code, error_register
+            ),
+            MailboxError::UnexpectedProtocol { received } => write!(
+                f,
+                "mailbox holds protocol {:#03x}, which is not the one being read",
+                received
             ),
         }
     }

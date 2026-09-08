@@ -1,6 +1,150 @@
 pub mod coe;
 pub mod eoe;
 
+use crate::{
+    SubDevice, SubDeviceRef,
+    error::{Error, MailboxError},
+    fmt,
+    pdu_loop::ReceivedPdu,
+    register::RegisterAddress,
+    subdevice::Mailbox,
+    timer_factory::IntoTimeout,
+};
+use core::ops::Deref;
+
+/// Waits for a SubDevice's mailboxes to be ready to read and write.
+///
+/// Nothing here is protocol specific - it is sync manager status and mailbox addresses - so
+/// it serves CoE and EoE alike rather than each carrying its own copy.
+pub(crate) async fn wait_for_mailboxes<S>(
+    subdevice: &SubDeviceRef<'_, S>,
+) -> Result<(Mailbox, Mailbox), Error>
+where
+    S: Deref<Target = SubDevice>,
+{
+    let write_mailbox = subdevice
+        .config
+        .mailbox
+        .write
+        .ok_or(Error::Mailbox(MailboxError::NoReadMailbox))?;
+    let read_mailbox = subdevice
+        .config
+        .mailbox
+        .read
+        .ok_or(Error::Mailbox(MailboxError::NoWriteMailbox))?;
+
+    let mailbox_read_sm_status = RegisterAddress::sync_manager_status(read_mailbox.sync_manager);
+    let mailbox_write_sm_status = RegisterAddress::sync_manager_status(write_mailbox.sync_manager);
+
+    // Ensure SubDevice OUT (master IN) mailbox is empty. We'll retry this multiple times in
+    // case the SubDevice is still busy or bugged or something.
+    for i in 0..10 {
+        let sm_status = subdevice
+            .read(mailbox_read_sm_status)
+            .receive::<crate::sync_manager_channel::Status>(subdevice.maindevice)
+            .await?;
+
+        // If flag is set, read entire mailbox to clear it
+        if sm_status.mailbox_full {
+            fmt::debug!(
+                "SubDevice {:#06x} OUT mailbox not empty (status {:?}). Clearing.",
+                subdevice.configured_address(),
+                sm_status
+            );
+
+            subdevice
+                .read(read_mailbox.address)
+                .ignore_wkc()
+                .receive_slice(subdevice.maindevice, read_mailbox.len)
+                .await?;
+        } else {
+            break;
+        }
+
+        // Don't delay on first iteration
+        if i > 0 {
+            subdevice.maindevice.timeouts.loop_tick().await;
+        }
+
+        if i > 1 {
+            fmt::debug!("--> Retrying clear");
+        }
+    }
+
+    // Wait for SubDevice IN mailbox to be available to receive data from master
+    async {
+        loop {
+            let sm_status = subdevice
+                .read(mailbox_write_sm_status)
+                .receive::<crate::sync_manager_channel::Status>(subdevice.maindevice)
+                .await?;
+
+            if !sm_status.mailbox_full {
+                break Ok(());
+            }
+
+            subdevice.maindevice.timeouts.loop_tick().await;
+        }
+    }
+    .timeout(subdevice.maindevice.timeouts.mailbox_echo())
+    .await
+    .inspect_err(|&e| {
+        fmt::error!(
+            "Mailbox IN ready error for SubDevice {:#06x}: {}",
+            subdevice.configured_address(),
+            e
+        );
+    })?;
+
+    Ok((read_mailbox, write_mailbox))
+}
+
+/// Waits for a SubDevice's OUT mailbox to fill, then reads it.
+pub(crate) async fn wait_for_mailbox_response<'maindevice, S>(
+    subdevice: &SubDeviceRef<'maindevice, S>,
+    read_mailbox: &Mailbox,
+) -> Result<ReceivedPdu<'maindevice>, Error>
+where
+    S: Deref<Target = SubDevice>,
+{
+    let mailbox_read_sm = RegisterAddress::sync_manager_status(read_mailbox.sync_manager);
+
+    // Wait for SubDevice OUT mailbox to be ready
+    async {
+        loop {
+            let sm_status = subdevice
+                .read(mailbox_read_sm)
+                .receive::<crate::sync_manager_channel::Status>(subdevice.maindevice)
+                .await?;
+
+            if sm_status.mailbox_full {
+                break Ok(());
+            }
+
+            subdevice.maindevice.timeouts.loop_tick().await;
+        }
+    }
+    .timeout(subdevice.maindevice.timeouts.mailbox_response())
+    .await
+    .inspect_err(|&e| {
+        fmt::error!(
+            "Response mailbox IN error for SubDevice {:#06x}: {}",
+            subdevice.configured_address(),
+            e
+        );
+    })?;
+
+    // Read acknowledgement from SubDevice OUT mailbox
+    let response = subdevice
+        .read(read_mailbox.address)
+        .receive_slice(subdevice.maindevice, read_mailbox.len)
+        .await?;
+
+    // TODO: Retries. Refer to SOEM's `ecx_mbxreceive` for inspiration
+
+    Ok(response)
+}
+
 #[derive(Default, Copy, Clone, Debug, PartialEq, Eq, ethercrab_wire::EtherCrabWireReadWrite)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]

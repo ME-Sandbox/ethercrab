@@ -68,8 +68,9 @@ pub enum EoeResult {
 /// offset for the rest). Hence two accessors, each `None` when the raw value does not mean
 /// what it asks for.
 ///
-/// Read from an [`EoeHeader`]; `raw_offset` is private, so one cannot be fabricated from
-/// outside the crate. Matching on it and reading its fields works as usual.
+/// Read from an [`EoeHeader`]; `raw_offset` is private, so one cannot be built or fully
+/// destructured from outside the crate. Reading the public fields, and matching with a
+/// trailing `..`, work as usual.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Fragment {
@@ -155,31 +156,35 @@ pub struct EoeHeader {
 ///
 /// | frame type | second word | evidence |
 /// |---|---|---|
-/// | `FragData` | fragment bookkeeping | `ec_eoe.c:384-394` writes it, `:465-505` reads it |
+/// | `FragData` | fragment bookkeeping | `ec_eoe.c:384-394` writes it, `:465-502` reads it |
 /// | `InitReq`, `GetIpParamReq` | unused, written as zero | `ec_eoe.c:97`, `:216` |
 /// | `InitResp` | a result code | `ec_eoe.c:157` |
 ///
 /// **The remaining four are not from the reference implementation.** They are listed
 /// separately rather than blended into the rows above:
 ///
-/// * `SetAddrFilterReq` and `GetAddrFilterReq` are treated as the other two requests. SOEM
-///   builds neither frame, so there is nothing to cite; a request that carries neither
-///   fragments nor an answer leaves nothing else for the word to be.
-/// * `SetAddrFilterResp` and `GetAddrFilterResp` carry a result per ETG.1000.6. It has to
-///   be so for [`EoeResult::NoFilterSupport`] to be reachable at all - that code can only
-///   ever arrive on an address filter response.
+/// * `SetAddrFilterReq` and `GetAddrFilterReq` are treated as the other two requests.
+///   `ec_eoe.h:114-119` names them, and a grep of the whole SOEM tree finds those four
+///   constants used by no `.c` file at all - so there is a definition but no behaviour to
+///   port. A request that carries neither fragments nor an answer leaves nothing else for
+///   the word to be.
+/// * `SetAddrFilterResp` and `GetAddrFilterResp` carry a result per ETG.1000.6. That
+///   [`EoeResult::NoFilterSupport`] exists at all fits, but does not prove it: nothing
+///   here or in the reference implementation stops a device from answering any response
+///   with any code, and this type will happily report `NoFilterSupport` on an `InitResp`.
 /// * `GetIpParamResp` carries a result. SOEM **does** implement this frame type
 ///   (`ecx_EOEgetIp`, `ec_eoe.c:238` onwards); it simply never reads the second word and
 ///   goes straight to the include flags in `data[0]` (`:244`).
 /// * `InitRespTimestamp` is an **assumption**, and the weakest cell in this table. SOEM
 ///   neither sends nor recognises frame type 1 - `ecx_EOErecv` reads `frameinfo2` as
-///   fragment bookkeeping without checking the type at all (`:465`) - and the only
-///   timestamp evidence to hand says the timestamp is 32 bits appended to the payload
-///   (`:519-522`), which says nothing about this 16 bit word. Treating it like the other
-///   responses is a guess, not evidence.
-// The state count has already gone from two to three once. A fourth would otherwise break
-// every downstream `match`; `TxRxResponse` in this crate carries the attribute for the same
-// reason.
+///   fragment bookkeeping without checking the type at all (`:465`) - and what timestamp
+///   handling exists says only that the timestamp is 32 bits appended to the payload
+///   (`:519-522`, and the same again at `:646-649`), which says nothing about this 16 bit
+///   word. Treating it like the other responses is a guess, not evidence.
+// The state count has already gone from two to three once, and a fourth would break every
+// downstream `match`. `TxRxResponse` is the crate's only precedent for the attribute; it is
+// a struct, so it carries it for the neighbouring reason - keeping room to add a field -
+// rather than this one.
 #[non_exhaustive]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -413,9 +418,10 @@ mod tests {
 
     #[test]
     fn a_refused_address_filter_is_reachable() {
-        // `NoFilterSupport` can only ever arrive on an address filter response. If those
-        // sat on the fragment arm, the crate would define a result code its own accessor
-        // could never return. Bytes: type 5, result 0x0401.
+        // If the address filter responses sat on the fragment arm, `NoFilterSupport` would
+        // be a result code no caller could ever receive on the response it belongs to.
+        // (It is not exclusive to them - nothing stops a device putting it on any
+        // response - but this is the one it is defined for.) Bytes: type 5, result 0x0401.
         let raw = [0x05, 0x00, 0x01, 0x04];
         let header = EoeHeader::unpack_from_slice(&raw).expect("a header");
 
@@ -629,8 +635,11 @@ mod tests {
             let unpacked = EoeHeader::unpack_from_slice(&packed).expect("Unpack");
 
             pretty_assertions::assert_eq!(header, unpacked);
-            // Without this the closure never touches the union at all - a `panic!()` as
-            // the first statement of `second_word()` left this test passing.
+            // The comparison is implied by the line above - `second_word()` is a pure
+            // function of fields that were just compared. What earns the line is the
+            // *call*: without it this closure never enters the union at all, and a
+            // `panic!()` in `second_word()` left it passing. Other tests in this module
+            // do catch that, so this is a second lock, not the only one.
             pretty_assertions::assert_eq!(header.second_word(), unpacked.second_word());
 
             Ok(())

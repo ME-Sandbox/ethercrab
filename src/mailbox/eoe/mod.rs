@@ -988,15 +988,18 @@ impl<'buf> Reassembly<'buf> {
     /// [`in_progress`](Self::in_progress) first.
     ///
     /// An **error leaves the half assembled frame in place**, so a stray fragment cannot
-    /// destroy a good one - with one exception: a last fragment that promises a timestamp
-    /// and is too short for one ends the frame either way, because the last fragment has
-    /// been consumed and nothing can follow it.
+    /// destroy a good one. The one exception is [`ReassemblyError::TimestampMissing`]:
+    /// the frame ends either way there, because the last fragment has been consumed and
+    /// nothing can follow it. (It fires when the *whole* frame so far is under four bytes,
+    /// not when that one fragment is.)
     ///
-    /// This is a deliberate difference from the stateful reference function, which zeroes
-    /// its state on a fragment, frame or offset mismatch (`ec_eoe.c:585-601`, `:612-621`,
-    /// `:623-632`). It can afford to: it is a mailbox hook with no notion of a partial
-    /// frame outliving a call, so resetting on any surprise is its only recovery. Here the
-    /// partial is a visible thing with [`in_progress`](Self::in_progress) and
+    /// This is a deliberate difference from `ecx_EOEreadfragment`, which zeroes its state
+    /// on a fragment, frame or offset mismatch (`ec_eoe.c:585-602`, `:614-622`,
+    /// `:623-631`). Its caller *can* reset it - the state lives in four variables the
+    /// caller owns - but it is given nothing to reset *from*: the return value says
+    /// "assembling", "done" or "error" and nothing about what is half built. So zeroing on
+    /// any surprise is the only recovery it can offer from inside. Here the partial is a
+    /// visible thing, through [`in_progress`](Self::in_progress) and
     /// [`abandon`](Self::abandon), and the caller owns the clock.
     ///
     /// # Errors
@@ -2185,6 +2188,9 @@ mod reassembly_tests {
             reassembly.push(header, b"abc"),
             Err(ReassemblyError::TimestampMissing { total: 3 })
         );
+        // The one error that clears the state, because the last fragment is consumed and
+        // nothing can follow it. Newly promised in `push`'s public doc, so pinned here.
+        assert_eq!(reassembly.in_progress(), None);
     }
 
     #[test]

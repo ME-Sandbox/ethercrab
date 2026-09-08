@@ -61,6 +61,16 @@ A pure Rust EtherCAT MainDevice supporting std and no_std environments.
   `Reassembly::into_buffer` hands the buffer back, for a caller that assembled a frame and
   wants to go on using the memory.
 
+  `SubDeviceRef::eoe_send` and `SubDeviceRef::eoe_receive` are the surface over the two
+  mailbox paths: one Ethernet frame out, one Ethernet frame in, per EoE port. Flat methods
+  rather than a handle, because that is how this crate already offers CoE - `sdo_read` and
+  its siblings delegate to a `Coe` a caller cannot name, since `mod mailbox` is private.
+
+  `eoe_receive` owns the mailbox while it runs. One mailbox carries every protocol a
+  SubDevice supports, so a CoE response arriving between two fragments is reported rather
+  than handed to whoever was waiting for it - the reference implementation's own shape.
+  Sorting the protocols apart needs a receive pump, which this does not include.
+
 - `MailboxError::UnexpectedProtocol` reports a mailbox holding a protocol other than the
   one being read. One mailbox carries every protocol a SubDevice supports, so a CoE
   response can arrive while an EoE fragment is expected. It carries the raw mailbox type

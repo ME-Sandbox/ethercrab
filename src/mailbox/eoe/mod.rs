@@ -1264,11 +1264,6 @@ impl EoeHeader {
 /// stack of an `async fn` is not something a `no_std` target can spare, and there is no
 /// allocator here to borrow one from. Writing straight into the PDU is what every other
 /// request in this crate does, and it is what [`EtherCrabWireWrite`] is for.
-// NOTE: No caller yet. The public EoE surface is the last work in this series, and
-// exporting these early to silence the warning is exactly the mistake this branch already
-// made once with `write_fragment` and had to undo - a lint may say *that* something is
-// wrong, never *what* the API should look like.
-#[allow(dead_code)]
 pub(crate) struct MailboxFragment<'a> {
     /// The EoE header of this fragment, as [`Fragments`] produced it.
     pub header: EoeHeader,
@@ -1336,7 +1331,6 @@ impl EtherCrabWireWrite for MailboxFragment<'_> {
 ///
 /// [`Error::WorkingCounter`] if a SubDevice does not acknowledge a mailbox write, and
 /// whatever else the PDU layer reports for a failed transfer.
-#[allow(dead_code)]
 pub(crate) async fn send_frame<S>(
     subdevice: &SubDeviceRef<'_, S>,
     port: u8,
@@ -3018,7 +3012,6 @@ mod mailbox_tests {
 ///
 /// [`Error::Reassembly`] for a fragment the reassembly refuses, and [`Error::Wire`] for a
 /// header that does not decode.
-#[allow(dead_code)]
 pub(crate) fn push_mailbox<'buf>(
     reassembly: &'buf mut Reassembly<'_>,
     payload: &[u8],
@@ -3097,7 +3090,6 @@ const MAX_FRAGMENTS: usize = Fragments::MAX_FRAME / 32;
 /// number of valid bytes with no way to learn how many.** The reassembly is dropped with
 /// the call, so nothing says how far it had got. A caller that needs to know holds its own
 /// [`Reassembly`], asks [`Reassembly::in_progress`], and feeds it [`push_mailbox`].
-#[allow(dead_code)]
 pub(crate) async fn receive_frame<'buf, S>(
     subdevice: &SubDeviceRef<'_, S>,
     port: u8,

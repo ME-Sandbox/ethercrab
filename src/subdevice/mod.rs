@@ -85,8 +85,6 @@ pub struct SubDevice {
 
     /// The counter that numbers outgoing EoE frames, bumped once per frame, not once per
     /// fragment.
-    // NOTE: Read only by the EoE send path, which has no public caller yet.
-    #[allow(dead_code)]
     pub(crate) eoe_frame_number: AtomicU8,
 
     /// DC config.
@@ -502,7 +500,6 @@ impl SubDevice {
     /// That is the reference implementation's own behaviour - `ec_eoe.c:394` hands the
     /// unmasked counter to `EOE_HDR_FRAME_NO_SET` - and it is harmless, because the
     /// fragments of one frame follow each other on the same port.
-    #[allow(dead_code)]
     pub(crate) fn next_eoe_frame_number(&self) -> u8 {
         // Incremented *before* use, as `ec_eoe.c:392` does, so the first frame is number 1
         // rather than 0. Wrapping is deliberate: the field is four bits wide anyway.
@@ -606,6 +603,58 @@ where
 
     pub(crate) fn dc_sync(&self) -> DcSync {
         self.state.dc_sync
+    }
+
+    /// Send one Ethernet frame to this SubDevice over Ethernet over EtherCAT.
+    ///
+    /// The frame is cut into fragments the mailbox can carry and written one at a time,
+    /// waiting for the SubDevice to take each before the next goes out. `port` is the EoE
+    /// port of a multi-port SubDevice; a device with one port uses zero.
+    ///
+    /// A flat method rather than a handle, because that is how this crate offers CoE:
+    /// [`sdo_read`](Self::sdo_read) and its siblings delegate to a `Coe` a caller cannot
+    /// name, since `mod mailbox` is private. One shape for both protocols.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Mailbox`] if the SubDevice has no write mailbox or it cannot hold the six
+    /// byte mailbox header and the four byte EoE header, [`Error::Fragment`] if the frame
+    /// cannot be cut for this mailbox - it is longer than the six bit offset field can
+    /// name, or the port does not fit its four bits - and [`Error::WorkingCounter`] if the
+    /// SubDevice does not acknowledge a fragment. **A failed write stops the frame**, so
+    /// the SubDevice may be left holding a partial one; it never gets the last fragment
+    /// and discards it.
+    pub async fn eoe_send(&self, port: u8, frame: &[u8]) -> Result<(), Error> {
+        crate::mailbox::eoe::send_frame(self, port, frame).await
+    }
+
+    /// Receive one Ethernet frame from this SubDevice over Ethernet over EtherCAT.
+    ///
+    /// Reads the SubDevice's mailbox until a whole frame has arrived, assembling it in
+    /// `buffer`, and returns the bytes of the frame. `port` is the EoE port the frame has
+    /// to belong to.
+    ///
+    /// **This owns the mailbox while it runs.** One mailbox carries every protocol a
+    /// SubDevice supports, so a CoE response arriving mid-frame is read here and reported
+    /// rather than handed to whoever was waiting for it. That is the reference
+    /// implementation's shape as well - `ecx_EOErecv` reads the mailbox directly - and it
+    /// is why SOEM grows a mailbox handler for anyone who needs both protocols at once.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Mailbox`] if the SubDevice has no read mailbox, or if the mailbox holds a
+    /// protocol other than EoE; [`Error::Reassembly`] for a fragment that does not fit the
+    /// frame being assembled, and for a SubDevice that keeps starting new frames without
+    /// ever finishing one; [`Error::Timeout`] if a fragment does not arrive in time.
+    ///
+    /// **On any error the partial frame is gone** and `buffer` holds an unspecified number
+    /// of valid bytes with no way to learn how many.
+    pub async fn eoe_receive<'buf>(
+        &self,
+        port: u8,
+        buffer: &'buf mut [u8],
+    ) -> Result<&'buf [u8], Error> {
+        crate::mailbox::eoe::receive_frame(self, port, buffer).await
     }
 
     /// Read a value from an SDO (Service Data Object) from the given index (address) and sub-index.

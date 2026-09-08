@@ -4,6 +4,7 @@
 //! function it was derived from, and the byte sequences are computed from those macros
 //! rather than read off a description of the protocol.
 
+use crate::fmt;
 use core::net::Ipv4Addr;
 use ethercrab_wire::{EtherCrabWireRead, EtherCrabWireWrite, WireError};
 
@@ -62,6 +63,9 @@ pub enum EoeResult {
     NoFilterSupport = 0x0401,
 }
 
+/// The largest port an EoE header can name: the field is four bits wide.
+const MAX_PORT: u8 = 0x0F;
+
 /// Fragment bookkeeping, the second header word of a frame that carries data.
 ///
 /// The offset field is **overloaded**, which is easy to miss and expensive to get wrong:
@@ -100,6 +104,25 @@ impl Fragment {
     /// what tells a receiver how large a buffer it needs.
     pub fn total_frame_size(&self) -> Option<u16> {
         (self.number == 0).then(|| u16::from(self.raw_offset) * 32)
+    }
+}
+
+// Hand written because `core::net::Ipv4Addr` has no `defmt::Format`, so the derive cannot
+// see through `Option<Ipv4Addr>`. Addresses go out as their four octets, which is what a
+// reader wants anyway. Same shape as `EthernetAddress`'s impl in `ethernet.rs`.
+#[cfg(feature = "defmt")]
+impl defmt::Format for IpParam {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(
+            f,
+            "IpParam {{ mac: {}, ip: {}, subnet: {}, gateway: {}, dns_ip: {}, dns_name: {} }}",
+            self.mac,
+            self.ip.map(|address| address.octets()),
+            self.subnet.map(|address| address.octets()),
+            self.gateway.map(|address| address.octets()),
+            self.dns_ip.map(|address| address.octets()),
+            self.dns_name.as_deref()
+        );
     }
 }
 
@@ -324,11 +347,6 @@ impl EoeHeader {
 /// * **The DNS name always occupies 32 bytes**, zero padded, however short it is -
 ///   `ec_eoe.c:131` copies `EOE_DNS_NAME_LENGTH` unconditionally, with the comment
 ///   "TwinCAT include EOE_DNS_NAME_LENGTH chars even if name is shorter".
-// No `defmt::Format`: `core::net::Ipv4Addr` does not implement it, so the derive cannot
-// see through `Option<Ipv4Addr>`. A hand written impl would have to spell out five fields
-// as octet arrays; until a defmt user asks for it, saying so is better than a derive that
-// does not compile - which is what stood here, unnoticed, because the gate does not build
-// this feature.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IpParam {
     /// MAC address.
@@ -599,7 +617,7 @@ impl<'a> Fragments<'a> {
     pub const MAX_FRAME: usize = Self::MAX_BLOCKS * Self::BLOCK;
 
     /// The port is a four bit field.
-    pub(crate) const MAX_NIBBLE: u8 = 0x0F;
+    const MAX_NIBBLE: u8 = MAX_PORT;
 
     /// Prepares to split `frame` for a mailbox that can carry `capacity` bytes of EoE
     /// payload.
@@ -776,7 +794,8 @@ pub enum ReassemblyError {
     /// A fragment arrived for a different port of the SubDevice.
     ///
     /// Two ports fragmenting at the same time would otherwise splice into one frame, half
-    /// of each. Checked on fragment zero, as `ec_eoe.c:487` does.
+    /// of each. Checked on **every** fragment, not only on fragment zero as `ec_eoe.c:487`
+    /// does - see [`Reassembly`] for why once is not enough here.
     WrongPort {
         /// The port this reassembly is for.
         expected: u8,
@@ -893,7 +912,7 @@ impl<'buf> Reassembly<'buf> {
     /// such a reassembly would reject every fragment off the wire and never say why.
     /// [`Fragments::new`] refuses the same value.
     pub fn new(buffer: &'buf mut [u8], port: u8) -> Result<Self, FragmentError> {
-        if port > Fragments::MAX_NIBBLE {
+        if port > MAX_PORT {
             return Err(FragmentError::PortTooWide { port });
         }
 
@@ -921,10 +940,6 @@ impl<'buf> Reassembly<'buf> {
             });
         };
 
-        // A fragment zero always starts a new frame, even mid-reassembly: a SubDevice that
-        // gives up on one simply begins the next. Refusing it would wedge the link, and
-        // the reference implementation lets it through as well - only to fail it one check
-        // later on the frame number, which names the wrong problem (`ec_eoe.c:467-476`).
         // Every fragment, not only fragment zero. The reference implementation checks it
         // once (`ec_eoe.c:487`), which is enough only when the caller already routes
         // fragments to the right reassembly. Checking each one makes the guard hold on its
@@ -938,6 +953,10 @@ impl<'buf> Reassembly<'buf> {
             });
         }
 
+        // A fragment zero always starts a new frame, even mid-reassembly: a SubDevice that
+        // gives up on one simply begins the next. Refusing it would wedge the link, and
+        // the reference implementation lets it through as well - only to fail it one check
+        // later on the frame number, which names the wrong problem (`ec_eoe.c:467-476`).
         if fragment.number == 0 {
             let announced = usize::from(fragment.total_frame_size().unwrap_or_default());
 
@@ -1035,16 +1054,13 @@ impl<'buf> Reassembly<'buf> {
             partial.filled
         };
 
-        // `length <= filled <= announced <= buffer.len()`, checked on fragment zero. An
-        // empty slice here would hand the caller a zero length ethernet frame instead of
-        // an error, which is the quietest possible way to be wrong.
-        self.buffer
-            .get(..length)
-            .map(Reassembled::Frame)
-            .ok_or(ReassemblyError::Overrun {
-                announced: partial.announced,
-                would_be: length,
-            })
+        // `length <= filled <= announced <= buffer.len()`, all checked above. The crate's
+        // own idiom for a slice that cannot be out of range: an empty one would hand the
+        // caller a zero length ethernet frame, and an `Overrun` would describe an
+        // *under*run - `length` is never above `announced`.
+        Ok(Reassembled::Frame(fmt::unwrap_opt!(
+            self.buffer.get(..length)
+        )))
     }
 }
 
@@ -2279,6 +2295,13 @@ mod reassembly_tests {
         assert_eq!(
             Reassembly::new(&mut buffer, 200).unwrap_err(),
             FragmentError::PortTooWide { port: 200 }
+        );
+        // The upper boundary, which `Fragments::new`'s test pins and this one did not:
+        // with `>=` instead of `>`, port 15 - a legal EoE port - becomes unusable and no
+        // test notices.
+        assert!(
+            Reassembly::new(&mut buffer, 15).is_ok(),
+            "15 is a real port"
         );
     }
 

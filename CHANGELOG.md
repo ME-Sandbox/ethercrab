@@ -45,6 +45,11 @@ A pure Rust EtherCAT MainDevice supporting std and no_std environments.
   fragment that does not fit is reported where it happens, rather than dropped silently so
   that the *next* fragment fails an order check and names the wrong problem.
 
+  `Reassembly::in_progress` and `Reassembly::abandon` are the timeout the reference has no
+  equivalent for: it keeps its state in local variables, so a timeout on the mailbox read
+  ends the call and the half frame ceases to exist. A push driven reassembly outlives the
+  wait, so the caller decides when to give up - and is told what it gave up on.
+
 ## [0.7.1] - 2026-03-23
 
 ### Fixed

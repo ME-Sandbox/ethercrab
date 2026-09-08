@@ -861,6 +861,25 @@ impl core::fmt::Display for ReassemblyError {
 #[cfg(feature = "std")]
 impl std::error::Error for ReassemblyError {}
 
+/// What a half assembled frame consists of so far.
+///
+/// The reference implementation has no equivalent: `ecx_EOErecv` keeps this in local
+/// variables, so a timeout on the mailbox read ends the call and the partial frame simply
+/// ceases to exist (`ec_eoe.c:437-541`). A push driven reassembly outlives the wait, so
+/// the caller decides when to give up - and wants to know what it is giving up on.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct InProgress {
+    /// The frame number the fragments so far belong to.
+    pub frame_number: u8,
+    /// Bytes assembled so far.
+    pub received: usize,
+    /// What fragment zero announced the whole frame would be, rounded up to 32 bytes.
+    pub announced: usize,
+    /// The fragment number that is due next.
+    pub next_fragment: u8,
+}
+
 /// What a fragment completed.
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -924,6 +943,30 @@ impl<'buf> Reassembly<'buf> {
             port,
             frame: None,
         })
+    }
+
+    /// What is half assembled, if anything.
+    ///
+    /// `None` right after a frame completes, or before the first fragment of the next one.
+    pub fn in_progress(&self) -> Option<InProgress> {
+        self.frame.map(|partial| InProgress {
+            frame_number: partial.number,
+            received: partial.filled,
+            announced: partial.announced,
+            next_fragment: partial.next_fragment,
+        })
+    }
+
+    /// Throws away a half assembled frame and reports what it was.
+    ///
+    /// This is the timeout: a SubDevice that stops mid-frame leaves the fragments so far
+    /// in place for ever otherwise, and the next frame's fragment zero would be the only
+    /// thing that clears them. `None` if there was nothing to throw away.
+    pub fn abandon(&mut self) -> Option<InProgress> {
+        let was = self.in_progress();
+        self.frame = None;
+
+        was
     }
 
     /// Adds one fragment.
@@ -2338,6 +2381,75 @@ mod reassembly_tests {
             Reassembly::new(&mut buffer, 16).unwrap_err(),
             FragmentError::PortTooWide { port: 16 }
         );
+    }
+
+    #[test]
+    fn a_fresh_reassembly_has_nothing_to_abandon() {
+        let mut buffer = [0u8; 128];
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
+
+        assert_eq!(reassembly.in_progress(), None);
+        assert_eq!(reassembly.abandon(), None);
+    }
+
+    #[test]
+    fn a_half_assembled_frame_can_be_abandoned() {
+        // `ecx_EOErecv` keeps its state in local variables, so a timeout on the mailbox
+        // read simply ends the call and the half frame ceases to exist. A push driven
+        // reassembly outlives the wait, so the caller has to say when to give up - and
+        // wants to know what it is giving up on.
+        let frame = [0u8; 250];
+        let mut buffer = [0u8; 512];
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
+        let parts = sent(&frame, 118, 7);
+
+        reassembly
+            .push(parts[0].0, &parts[0].1)
+            .expect("fragment zero");
+
+        let progress = reassembly.in_progress().expect("a frame is half assembled");
+        assert_eq!(progress.frame_number, 7);
+        assert_eq!(progress.received, 96);
+        assert_eq!(progress.announced, 256);
+
+        assert_eq!(reassembly.abandon(), Some(progress));
+        assert_eq!(reassembly.in_progress(), None, "and it is gone");
+    }
+
+    #[test]
+    fn after_abandoning_the_next_frame_starts_clean() {
+        let abandoned = [1u8; 250];
+        let next = [2u8; 40];
+        let mut buffer = [0u8; 512];
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
+
+        let half = sent(&abandoned, 118, 3);
+        reassembly
+            .push(half[0].0, &half[0].1)
+            .expect("fragment zero");
+        reassembly.abandon();
+
+        assert_eq!(
+            feed(&mut reassembly, &sent(&next, 118, 4)),
+            Some(next.to_vec())
+        );
+    }
+
+    #[test]
+    fn abandoning_a_finished_frame_finds_nothing() {
+        // A frame that completed is not "in progress" - the state is cleared when the
+        // last fragment lands, so a caller polling for a stale reassembly sees none.
+        let frame = [0u8; 40];
+        let mut buffer = [0u8; 128];
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
+        let parts = sent(&frame, 118, 0);
+
+        reassembly
+            .push(parts[0].0, &parts[0].1)
+            .expect("the whole frame");
+
+        assert_eq!(reassembly.in_progress(), None);
+        assert_eq!(reassembly.abandon(), None);
     }
 
     #[test]

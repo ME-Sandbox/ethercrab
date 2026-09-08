@@ -194,8 +194,8 @@ pub use ethercrab_wire::{
 use ethernet::EthernetAddress;
 pub use mailbox::coe::SubIndex;
 pub use mailbox::eoe::{
-    EoeHeader, EoeResult, Fragment, Fragments, FrameType, IpParam, Reassembled, Reassembly,
-    SecondWord,
+    EoeHeader, EoeResult, Fragment, Fragments, FrameType, InProgress, IpParam, Reassembled,
+    Reassembly, SecondWord,
 };
 pub use maindevice::MainDevice;
 pub use maindevice_config::{MainDeviceConfig, RetryBehaviour};

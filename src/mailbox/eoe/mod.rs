@@ -404,7 +404,10 @@ impl EtherCrabWireWrite for IpParam {
                 }
             };
 
-            debug_assert!(bytes <= width, "a field cannot be wider than its slot");
+            // No check that `bytes <= width`: both sources are bounded by their type -
+            // a `[u8; 6]` MAC and a `heapless::String<32>` name - and a check placed
+            // after `copy_from_slice` would arrive after the slice index had already
+            // panicked anyway.
             flags |= flag;
             at += width;
         }
@@ -934,7 +937,10 @@ mod ip_param_tests {
             ip: Some(Ipv4Addr::new(10, 0, 0, 42)),
             subnet: Some(Ipv4Addr::new(255, 0, 0, 0)),
             gateway: Some(Ipv4Addr::new(10, 0, 0, 1)),
-            dns_ip: Some(Ipv4Addr::new(8, 8, 8, 8)),
+            // Deliberately not 8.8.8.8: a palindromic address reads the same in both
+            // byte orders, so it pins the offset and nothing else. Every address in
+            // these tests has four distinct octets for that reason.
+            dns_ip: Some(Ipv4Addr::new(8, 7, 6, 5)),
             dns_name: Some(heapless::String::try_from("murr").expect("fits")),
         };
 
@@ -977,7 +983,7 @@ mod ip_param_tests {
             ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
             subnet: Some(Ipv4Addr::new(255, 255, 0, 0)),
             gateway: Some(Ipv4Addr::new(10, 0, 0, 254)),
-            dns_ip: Some(Ipv4Addr::new(9, 9, 9, 9)),
+            dns_ip: Some(Ipv4Addr::new(9, 8, 7, 6)),
             dns_name: Some(heapless::String::try_from("dns").expect("fits")),
         };
 
@@ -990,7 +996,11 @@ mod ip_param_tests {
         assert_eq!(&written[10..14], &[1, 0, 0, 10], "IP, last octet first");
         assert_eq!(&written[14..18], &[0, 0, 255, 255], "subnet");
         assert_eq!(&written[18..22], &[254, 0, 0, 10], "gateway");
-        assert_eq!(&written[22..26], &[9, 9, 9, 9], "DNS server");
+        assert_eq!(
+            &written[22..26],
+            &[6, 7, 8, 9],
+            "DNS server, last octet first"
+        );
         assert_eq!(&written[26..29], b"dns", "DNS name");
         assert_eq!(written.len(), 4 + 6 + 4 + 4 + 4 + 4 + 32);
     }
@@ -1044,5 +1054,18 @@ mod ip_param_tests {
         let written = param.pack_to_slice(&mut buffer).expect("room");
 
         assert_eq!(IpParam::unpack_from_slice(written), Ok(param));
+    }
+
+    #[test]
+    fn a_dns_name_flag_over_a_short_payload_is_an_error() {
+        // The truncation test above only covers the four byte IP field, so a reader that
+        // clamped its bounds instead of rejecting them stayed green. Here the flag
+        // promises 32 bytes and one arrives.
+        let claims_a_name = [0x20, 0x00, 0x00, 0x00, b'a'];
+
+        assert_eq!(
+            IpParam::unpack_from_slice(&claims_a_name),
+            Err(WireError::ReadBufferTooShort)
+        );
     }
 }

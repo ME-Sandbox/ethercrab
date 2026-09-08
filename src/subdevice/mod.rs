@@ -83,6 +83,12 @@ pub struct SubDevice {
     /// The 1-7 cyclic counter used when working with mailbox requests.
     pub(crate) mailbox_counter: AtomicU8,
 
+    /// The counter that numbers outgoing EoE frames, bumped once per frame, not once per
+    /// fragment.
+    // NOTE: Read only by the EoE send path, which has no public caller yet.
+    #[allow(dead_code)]
+    pub(crate) eoe_frame_number: AtomicU8,
+
     /// DC config.
     pub(crate) dc_sync: DcSync,
 
@@ -108,7 +114,8 @@ impl PartialEq for SubDevice {
             && self.parent_index == other.parent_index
             && self.propagation_delay == other.propagation_delay
             && self.dc_sync == other.dc_sync
-        // NOTE: No mailbox_counter
+        // NOTE: No mailbox_counter, and for the same reason no eoe_frame_number: both are
+        // where the SubDevice is in a conversation, not what it is.
     }
 }
 
@@ -131,6 +138,7 @@ impl Clone for SubDevice {
             propagation_delay: self.propagation_delay,
             dc_sync: self.dc_sync,
             mailbox_counter: AtomicU8::new(self.mailbox_counter.load(Ordering::Acquire)),
+            eoe_frame_number: AtomicU8::new(self.eoe_frame_number.load(Ordering::Acquire)),
             oversampling_config: &[],
         }
     }
@@ -230,6 +238,9 @@ impl SubDevice {
             dc_sync: DcSync::Disabled,
             // 0 is a reserved value, so we initialise the cycle at 1. The cycle repeats 1 - 7.
             mailbox_counter: AtomicU8::new(1),
+            // `ec_eoe.c:341` starts its `static uint8_t txframeno` at 0 and increments
+            // *before* writing it (`:392`), so the first frame on the wire is number 1.
+            eoe_frame_number: AtomicU8::new(0),
             oversampling_config: &[],
         })
     }
@@ -476,6 +487,28 @@ impl SubDevice {
                     if n >= 7 { Some(1) } else { Some(n + 1) }
                 })
         )
+    }
+
+    /// Return the next EoE frame number, which identifies one Ethernet frame across all of
+    /// its fragments.
+    ///
+    /// Calling this method increments the counter, so it is called **once per frame** and
+    /// the number it returns is used for every fragment of that frame. A receiver rejects a
+    /// fragment whose frame number differs from the one it is assembling
+    /// (`ec_eoe.c:496`), so bumping it per fragment would break every frame that needs
+    /// more than one.
+    ///
+    /// Only the low four bits reach the wire, so the number repeats every sixteen frames.
+    /// That is the reference implementation's own behaviour - `ec_eoe.c:394` hands the
+    /// unmasked counter to `EOE_HDR_FRAME_NO_SET` - and it is harmless, because the
+    /// fragments of one frame follow each other on the same port.
+    #[allow(dead_code)]
+    pub(crate) fn next_eoe_frame_number(&self) -> u8 {
+        // Incremented *before* use, as `ec_eoe.c:392` does, so the first frame is number 1
+        // rather than 0. Wrapping is deliberate: the field is four bits wide anyway.
+        self.eoe_frame_number
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
     }
 }
 

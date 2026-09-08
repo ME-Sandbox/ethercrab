@@ -42,7 +42,6 @@ where
         .ok_or(Error::Mailbox(MailboxError::NoWriteMailbox))?;
 
     let mailbox_read_sm_status = RegisterAddress::sync_manager_status(read_mailbox.sync_manager);
-    let mailbox_write_sm_status = RegisterAddress::sync_manager_status(write_mailbox.sync_manager);
 
     // Ensure SubDevice OUT (master IN) mailbox is empty. We'll retry this multiple times in
     // case the SubDevice is still busy or bugged or something.
@@ -79,6 +78,33 @@ where
         }
     }
 
+    wait_for_write_mailbox(subdevice, &write_mailbox).await?;
+
+    Ok((read_mailbox, write_mailbox))
+}
+
+/// Waits for a SubDevice's IN mailbox to be empty, so the MainDevice can write to it.
+///
+/// This is the half of [`wait_for_mailboxes`] that a **send** needs, and the whole of what
+/// the reference implementation's send does: `ecx_mbxsend` writes the mailbox and, if the
+/// write fails, waits on `ecx_mbxempty` and retries (`ec_main.c:1565-1573`). It never
+/// touches the OUT mailbox.
+///
+/// That is the reason this is separate rather than a convenience. [`wait_for_mailboxes`]
+/// also **empties the OUT mailbox**, which is right for a request/response transaction like
+/// CoE - a stale response there would be read as the answer to the request about to be
+/// sent. For EoE it is wrong: the OUT mailbox is where received EoE fragments arrive, so
+/// clearing it before every fragment of an outgoing frame would discard incoming ones and
+/// leave a reassembly permanently short of a fragment.
+pub(crate) async fn wait_for_write_mailbox<S>(
+    subdevice: &SubDeviceRef<'_, S>,
+    write_mailbox: &Mailbox,
+) -> Result<(), Error>
+where
+    S: Deref<Target = SubDevice>,
+{
+    let mailbox_write_sm_status = RegisterAddress::sync_manager_status(write_mailbox.sync_manager);
+
     // Wait for SubDevice IN mailbox to be available to receive data from master
     async {
         loop {
@@ -104,7 +130,7 @@ where
         );
     })?;
 
-    Ok((read_mailbox, write_mailbox))
+    Ok(())
 }
 
 /// Waits for a SubDevice's OUT mailbox to fill, then reads it.

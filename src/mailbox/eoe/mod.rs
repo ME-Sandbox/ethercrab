@@ -6,7 +6,12 @@
 
 use crate::fmt;
 use crate::mailbox::{MailboxHeader, MailboxType, Priority};
+use crate::{
+    SubDevice, SubDeviceRef,
+    error::{Error, MailboxError},
+};
 use core::net::Ipv4Addr;
+use core::ops::Deref;
 use ethercrab_wire::{EtherCrabWireRead, EtherCrabWireSized, EtherCrabWireWrite, WireError};
 
 /// EoE frame type, the low four bits of the first header word.
@@ -1203,6 +1208,126 @@ impl EoeHeader {
 
         Ok(used)
     }
+}
+
+/// One EoE fragment as a mailbox payload, ready to hand to a write command.
+///
+/// This exists so the send loop needs **no buffer of its own**. A fragment can be a whole
+/// mailbox wide, and a mailbox is up to 1486 bytes; a staging array of that size on the
+/// stack of an `async fn` is not something a `no_std` target can spare, and there is no
+/// allocator here to borrow one from. Writing straight into the PDU is what every other
+/// request in this crate does, and it is what [`EtherCrabWireWrite`] is for.
+// NOTE: No caller yet. The public EoE surface is the last work in this series, and
+// exporting these early to silence the warning is exactly the mistake this branch already
+// made once with `write_fragment` and had to undo - a lint may say *that* something is
+// wrong, never *what* the API should look like.
+#[allow(dead_code)]
+pub(crate) struct MailboxFragment<'a> {
+    /// The EoE header of this fragment, as [`Fragments`] produced it.
+    pub header: EoeHeader,
+    /// The mailbox counter, 1 to 7 inclusive.
+    pub counter: u8,
+    /// This fragment's slice of the Ethernet frame.
+    pub data: &'a [u8],
+}
+
+impl EtherCrabWireWrite for MailboxFragment<'_> {
+    fn pack_to_slice_unchecked<'buf>(&self, buf: &'buf mut [u8]) -> &'buf [u8] {
+        // The trait's contract for this method is to panic when the buffer is too short,
+        // which is exactly what the crate's derived implementations do by indexing.
+        // `packed_len` below is what a caller sizes the buffer from, and it counts the
+        // same three pieces `write_fragment` writes.
+        fmt::unwrap!(self.header.write_fragment(buf, self.counter, self.data))
+    }
+
+    fn packed_len(&self) -> usize {
+        MailboxHeader::PACKED_LEN + EoeHeader::PACKED_LEN + self.data.len()
+    }
+}
+
+/// Sends one Ethernet frame to a SubDevice's EoE `port`, fragment by fragment.
+///
+/// Ported from `ecx_EOEsend` (`ec_eoe.c:333-430`). The loop there is: build a fragment,
+/// take a new mailbox counter, write the mailbox, and go round again while the write
+/// worked and the last fragment has not gone out. `Fragments` already owns the splitting
+/// and every rule in it, so what is left here is the waiting and the counters.
+///
+/// Three things this does that the reference does differently:
+///
+/// - It waits with [`wait_for_write_mailbox`](crate::mailbox::wait_for_write_mailbox)
+///   *before* each write. `ecx_mbxsend` writes first and only waits if the write failed
+///   (`ec_main.c:1568`). Waiting first costs one register read per fragment and turns a
+///   full mailbox from an error into a delay - EtherCrab's CoE path already does it this
+///   way, so an EoE send behaves like every other mailbox write here.
+/// - A failed write **stops the frame**. The reference leaves the loop on `wkc <= 0` too,
+///   but returns that work counter as its result, so a caller has to know that a positive
+///   number means "sent" and anything else means "half a frame is in the SubDevice". Here
+///   it is an `Err`, and the partial frame is the SubDevice's to discard - it never gets
+///   the last fragment.
+/// - The frame number comes from the SubDevice
+///   ([`next_eoe_frame_number`](crate::SubDevice::next_eoe_frame_number)), not from a
+///   `static` shared by every SubDevice on the bus as `ec_eoe.c:341` has it.
+///
+/// # Errors
+///
+/// [`Error::Mailbox`] if the SubDevice has no write mailbox or it is too small to hold the
+/// two headers, [`Error::Eoe`] for anything `Fragments` refuses (a frame too long for the
+/// offset field, a port wider than four bits, a mailbox that cannot carry a whole 32 byte
+/// block of a frame that has to be split), and whatever the PDU layer reports for a write
+/// that does not come back with a working counter of 1.
+#[allow(dead_code)]
+pub(crate) async fn send_frame<S>(
+    subdevice: &SubDeviceRef<'_, S>,
+    port: u8,
+    frame: &[u8],
+) -> Result<(), Error>
+where
+    S: Deref<Target = SubDevice>,
+{
+    let write_mailbox = subdevice
+        .config
+        .mailbox
+        .write
+        .ok_or(Error::Mailbox(MailboxError::NoReadMailbox))?;
+
+    // `maxdata = mbx_l - 0x0A` (`ec_eoe.c:344`): the mailbox minus its own six byte header
+    // and the four byte EoE header. `:351` gives up when that goes negative, and so does
+    // this - a mailbox that cannot hold the two headers cannot carry a fragment at all,
+    // not even an empty one, and writing anyway would run past the SubDevice's mailbox.
+    let capacity = usize::from(write_mailbox.len)
+        .checked_sub(MailboxHeader::PACKED_LEN + EoeHeader::PACKED_LEN)
+        .ok_or(FragmentError::MailboxTooSmall {
+            capacity: 0,
+            length: frame.len(),
+        })?;
+
+    // Once per frame, before the loop: every fragment of one frame carries the same number,
+    // and a receiver rejects one that does not (`ec_eoe.c:496`).
+    let frame_number = subdevice.next_eoe_frame_number();
+
+    for (header, data) in Fragments::new(frame, capacity, frame_number, port)? {
+        // Only the SubDevice IN mailbox is waited on. Emptying the OUT mailbox here - what
+        // `wait_for_mailboxes` does for CoE - would throw away received EoE fragments and
+        // leave the reassembly on the other side of this link one fragment short.
+        crate::mailbox::wait_for_write_mailbox(subdevice, &write_mailbox).await?;
+
+        subdevice
+            .write(write_mailbox.address)
+            .with_len(write_mailbox.len)
+            .send(
+                subdevice.maindevice,
+                MailboxFragment {
+                    header,
+                    // A new counter per fragment, as `ec_eoe.c:397` takes one per
+                    // iteration of its loop rather than one per frame.
+                    counter: subdevice.mailbox_counter(),
+                    data,
+                },
+            )
+            .await?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2784,5 +2909,410 @@ mod mailbox_tests {
         }
 
         assert_eq!(rejoined, frame);
+    }
+}
+
+/// The asynchronous half of the send path, against a loopback "SubDevice".
+///
+/// There is no bus here and no recorded capture. Every frame the PDU loop sends is handed
+/// straight back to it with a working counter of 1, which is all a SubDevice has to do for
+/// this loop: answer the sync manager status read - zeroes mean "mailbox empty" - and
+/// acknowledge the mailbox write. What the loop wrote is kept on the way past, so the
+/// assertions are about the bytes that would have gone on a wire.
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+    use crate::{
+        MainDevice, MainDeviceConfig, PduStorage, SubDevice, SubDeviceRef, Timeouts,
+        ethernet::{EthernetAddress, EthernetFrame},
+        subdevice::Mailbox,
+    };
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::time::Duration;
+    use ethercrab_wire::EtherCrabWireWriteSized;
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
+
+    const CONFIGURED_ADDRESS: u16 = 0x1001;
+    const WRITE_MAILBOX_ADDRESS: u16 = 0x1800;
+
+    /// Raw command codes, ETG1000.4 Table 5. The mailbox write is the only FPWR the send
+    /// loop makes; the only other thing it does is read a register with an FPRD.
+    const FPRD: u8 = 0x04;
+    const FPWR: u8 = 0x05;
+
+    /// Walks the PDUs of one EtherCAT frame, handing each one's command code, register
+    /// address, data and working counter to `f`.
+    ///
+    /// Deliberately not built from this crate's own `PduHeader`: a test that decodes the
+    /// wire with the same code that wrote it cannot see a layout mistake in either. The
+    /// shape is ETG1000.4 5.4.1.2 - two bytes of EtherCAT header, then per PDU ten bytes of
+    /// header, `len` bytes of data and a two byte working counter, with bit 15 of the flags
+    /// saying whether another PDU follows.
+    fn for_each_pdu(ethercat: &mut [u8], mut f: impl FnMut(u8, u16, &mut [u8], &mut [u8])) {
+        let mut offset = 2;
+
+        loop {
+            let command = ethercat[offset];
+            // Bytes 2..6 are the command's own four: for an FPRD or an FPWR that is the
+            // configured address (ADP) and then the register (ADO).
+            let register = u16::from_le_bytes([ethercat[offset + 4], ethercat[offset + 5]]);
+            let flags = u16::from_le_bytes([ethercat[offset + 6], ethercat[offset + 7]]);
+            let len = usize::from(flags & 0x07FF);
+            let more_follows = flags & 0x8000 != 0;
+
+            let (data, wkc) = ethercat[offset + 10..offset + 10 + len + 2].split_at_mut(len);
+
+            f(command, register, data, wkc);
+
+            offset += 10 + len + 2;
+
+            if !more_follows {
+                break;
+            }
+        }
+    }
+
+    /// A SubDevice with one mailbox `len` bytes wide, and the counters a real one starts
+    /// with.
+    fn subdevice_with_mailbox(len: u16) -> SubDevice {
+        let mut subdevice = SubDevice {
+            configured_address: CONFIGURED_ADDRESS,
+            ..SubDevice::default()
+        };
+
+        subdevice.config.mailbox.read = Some(Mailbox {
+            address: 0x1c00,
+            len,
+            sync_manager: 1,
+        });
+        subdevice.config.mailbox.write = Some(Mailbox {
+            address: WRITE_MAILBOX_ADDRESS,
+            len,
+            sync_manager: 0,
+        });
+
+        // `SubDevice::default()` is a test-only derive, so every counter would start at
+        // zero - and zero is a reserved mailbox counter. A real SubDevice starts its at one
+        // (`SubDevice::new`), and the numbers asserted below are that sequence.
+        subdevice.mailbox_counter.store(1, Ordering::Release);
+
+        subdevice
+    }
+
+    /// A mailbox 42 bytes wide carries 32 bytes of EoE payload: exactly one block.
+    const MAILBOX_LEN: u16 = 42;
+    const CAPACITY: usize = MAILBOX_LEN as usize - 10;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn one_mailbox_write_per_fragment_with_a_fresh_counter_each_time() {
+        const MAX_FRAMES: usize = 16;
+        const MAX_PDU_DATA: usize = PduStorage::element_size(128);
+
+        static PDU_STORAGE: PduStorage<MAX_FRAMES, MAX_PDU_DATA> = PduStorage::new();
+
+        crate::test_logger();
+
+        let (mut tx, mut rx, pdu_loop) = PDU_STORAGE.try_split().expect("can only split once");
+
+        let (net_tx, net_rx) = mpsc::sync_channel::<Vec<u8>>(16);
+
+        let written = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let read = Arc::new(Mutex::new(Vec::<u16>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // The register the SubDevice OUT mailbox's sync manager reports its status in.
+        let out_mailbox_status = crate::register::RegisterAddress::sync_manager_status(1);
+
+        let stop_tx = stop.clone();
+
+        let tx_handle = thread::spawn(move || {
+            while !stop_tx.load(Ordering::Relaxed) {
+                while let Some(frame) = tx.next_sendable_frame() {
+                    frame
+                        .send_blocking(|bytes| {
+                            net_tx.send(bytes.to_vec()).expect("RX task gone");
+
+                            Ok(bytes.len())
+                        })
+                        .expect("Send");
+
+                    thread::yield_now();
+                }
+
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let written_rx = written.clone();
+        let read_rx = read.clone();
+
+        let rx_handle = thread::spawn(move || {
+            while let Ok(sent) = net_rx.recv() {
+                let mut frame = EthernetFrame::new_checked(sent).expect("A frame");
+
+                // A response comes back from the SubDevice, not from us
+                frame.set_src_addr(EthernetAddress([0x12, 0x10, 0x10, 0x10, 0x10, 0x10]));
+
+                for_each_pdu(frame.payload_mut(), |command, register, data, wkc| {
+                    match command {
+                        FPWR => written_rx.lock().expect("Poisoned").push(data.to_vec()),
+                        FPRD => read_rx.lock().expect("Poisoned").push(register),
+                        other => panic!("The send loop issued command {:#04x}", other),
+                    }
+
+                    // The OUT mailbox is reported FULL for the whole run. A send has no
+                    // business emptying it - that is where received EoE fragments sit - so
+                    // the loop must never look, and if it did, `wait_for_mailboxes` would
+                    // read the mailbox out to clear it and the assertion below would see
+                    // the address.
+                    if register == out_mailbox_status {
+                        data.copy_from_slice(
+                            &crate::sync_manager_channel::Status {
+                                mailbox_full: true,
+                                ..Default::default()
+                            }
+                            .pack(),
+                        );
+                    }
+
+                    // One SubDevice answered. Without this the write fails on its working
+                    // counter and the loop stops after the first fragment.
+                    wkc.copy_from_slice(&1u16.to_le_bytes());
+                });
+
+                let frame = frame.into_inner();
+
+                while rx.receive_frame(&frame).is_err() {}
+
+                thread::yield_now();
+            }
+        });
+
+        let maindevice = MainDevice::new(
+            pdu_loop,
+            Timeouts {
+                pdu: Duration::from_secs(1),
+                wait_loop_delay: Duration::ZERO,
+                ..Timeouts::default()
+            },
+            MainDeviceConfig::default(),
+        );
+
+        let subdevice = subdevice_with_mailbox(MAILBOX_LEN);
+        let subdevice_ref = SubDeviceRef::new(&maindevice, CONFIGURED_ADDRESS, &subdevice);
+
+        // Three fragments: 32, 32 and the 6 byte remainder. The bytes count up so a
+        // fragment landing at the wrong offset cannot look right.
+        let frame = (0..70u8).collect::<Vec<_>>();
+
+        let result = send_frame(&subdevice_ref, 0, &frame).await;
+
+        stop.store(true, Ordering::Relaxed);
+        tx_handle.join().expect("TX task");
+        rx_handle.join().expect("RX task");
+
+        result.expect("Send frame");
+
+        let written = written.lock().expect("Poisoned").clone();
+        let read = read.lock().expect("Poisoned").clone();
+
+        assert_eq!(written.len(), 3, "one mailbox write per fragment");
+
+        // The whole reason the send path does not call `wait_for_mailboxes`: that one
+        // empties the OUT mailbox, and the OUT mailbox is where a SubDevice puts the EoE
+        // fragments it is sending *us*. Reading it here would drop them.
+        assert!(
+            !read.contains(&0x1c00),
+            "the send loop must never read the OUT mailbox, but read {:#06x?}",
+            read
+        );
+
+        for (index, payload) in written.iter().enumerate() {
+            assert_eq!(
+                payload.len(),
+                usize::from(MAILBOX_LEN),
+                "fragment {} fills the whole mailbox, as `ecx_mbxsend` writes `mbx_l`",
+                index
+            );
+
+            let mailbox = MailboxHeader::unpack_from_slice(payload).expect("A mailbox header");
+
+            assert_eq!(mailbox.mailbox_type, MailboxType::Eoe);
+            assert_eq!(
+                mailbox.counter,
+                index as u8 + 1,
+                "`ec_eoe.c:397` takes a new counter per fragment, not per frame"
+            );
+
+            let header = EoeHeader::unpack_from_slice(&payload[6..]).expect("An EoE header");
+
+            assert_eq!(header.frame_type, FrameType::FragData);
+            assert_eq!(header.port, 0);
+
+            let fragment = header.fragment().expect("Fragment bookkeeping");
+
+            assert_eq!(fragment.number, index as u8);
+            assert_eq!(
+                fragment.frame_number, 1,
+                "every fragment of one frame carries the same number, and \
+                 `eoe_frame_number` starts at zero and is bumped before use"
+            );
+        }
+
+        let first = EoeHeader::unpack_from_slice(&written[0][6..])
+            .expect("An EoE header")
+            .fragment()
+            .expect("Fragment bookkeeping");
+
+        assert_eq!(
+            first.total_frame_size(),
+            Some(96),
+            "fragment zero announces the whole frame, rounded up to 32 bytes"
+        );
+
+        for (index, (payload, expected_offset)) in
+            written.iter().zip([None, Some(32), Some(64)]).enumerate()
+        {
+            let header = EoeHeader::unpack_from_slice(&payload[6..]).expect("An EoE header");
+
+            assert_eq!(
+                header.fragment().expect("Fragment bookkeeping").offset(),
+                expected_offset,
+                "offset of fragment {}",
+                index
+            );
+
+            assert_eq!(
+                header.last_fragment,
+                index == 2,
+                "only the last fragment ends the frame"
+            );
+
+            let data = &payload[10..];
+            let start = index * CAPACITY;
+            let end = (start + CAPACITY).min(frame.len());
+
+            assert_eq!(
+                &data[..end - start],
+                &frame[start..end],
+                "the bytes of fragment {}",
+                index
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mailbox_too_small_for_the_two_headers_is_refused() {
+        const MAX_FRAMES: usize = 2;
+        const MAX_PDU_DATA: usize = PduStorage::element_size(64);
+
+        static PDU_STORAGE: PduStorage<MAX_FRAMES, MAX_PDU_DATA> = PduStorage::new();
+
+        crate::test_logger();
+
+        let (_tx, _rx, pdu_loop) = PDU_STORAGE.try_split().expect("can only split once");
+
+        let maindevice =
+            MainDevice::new(pdu_loop, Timeouts::default(), MainDeviceConfig::default());
+
+        // Nine bytes cannot hold the six byte mailbox header and the four byte EoE header,
+        // so `maxdata` is negative and `ec_eoe.c:351` gives up. Nothing is sent, so this
+        // needs no network at all - the error comes before the first await.
+        let subdevice = subdevice_with_mailbox(9);
+        let subdevice_ref = SubDeviceRef::new(&maindevice, CONFIGURED_ADDRESS, &subdevice);
+
+        assert_eq!(
+            send_frame(&subdevice_ref, 0, &[]).await,
+            Err(Error::Fragment(FragmentError::MailboxTooSmall {
+                capacity: 0,
+                length: 0
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subdevice_without_a_write_mailbox_is_refused() {
+        const MAX_FRAMES: usize = 2;
+        const MAX_PDU_DATA: usize = PduStorage::element_size(64);
+
+        static PDU_STORAGE: PduStorage<MAX_FRAMES, MAX_PDU_DATA> = PduStorage::new();
+
+        crate::test_logger();
+
+        let (_tx, _rx, pdu_loop) = PDU_STORAGE.try_split().expect("can only split once");
+
+        let maindevice =
+            MainDevice::new(pdu_loop, Timeouts::default(), MainDeviceConfig::default());
+
+        let mut subdevice = subdevice_with_mailbox(MAILBOX_LEN);
+        subdevice.config.mailbox.write = None;
+
+        let subdevice_ref = SubDeviceRef::new(&maindevice, CONFIGURED_ADDRESS, &subdevice);
+
+        assert_eq!(
+            send_frame(&subdevice_ref, 0, &[]).await,
+            Err(Error::Mailbox(MailboxError::NoReadMailbox))
+        );
+    }
+
+    #[test]
+    fn the_frame_number_is_bumped_once_and_wraps() {
+        let subdevice = SubDevice::default();
+
+        // `ec_eoe.c:392` increments before writing, so the first frame on the wire is 1 and
+        // not 0.
+        assert_eq!(subdevice.next_eoe_frame_number(), 1);
+        assert_eq!(subdevice.next_eoe_frame_number(), 2);
+
+        subdevice.eoe_frame_number.store(255, Ordering::Release);
+
+        // A `static uint8_t` wraps there too, and only the low four bits reach the wire.
+        assert_eq!(subdevice.next_eoe_frame_number(), 0);
+    }
+
+    #[test]
+    fn a_mailbox_fragment_writes_exactly_what_write_fragment_writes() {
+        // `packed_len` is what the PDU layer sizes its buffer from. If it disagreed with
+        // what `pack_to_slice_unchecked` writes, the payload would be truncated or the
+        // write would panic - so the two are checked against each other here.
+        let header = EoeHeader::new(FrameType::FragData, 3);
+        let fragment = MailboxFragment {
+            header,
+            counter: 4,
+            data: b"twelve bytes",
+        };
+
+        assert_eq!(fragment.packed_len(), 6 + 4 + 12);
+
+        let mut direct = [0u8; 64];
+        let expected = header
+            .write_fragment(&mut direct, 4, b"twelve bytes")
+            .expect("Room");
+
+        let mut packed = [0u8; 64];
+        let written = fragment.pack_to_slice(&mut packed).expect("Room");
+
+        assert_eq!(written, expected);
+        assert_eq!(written.len(), fragment.packed_len());
+    }
+
+    #[test]
+    fn a_buffer_too_short_for_a_mailbox_fragment_is_an_error_not_a_panic() {
+        // `pack_to_slice` is the checked entry point the trait provides over
+        // `pack_to_slice_unchecked`, and it is what a caller that cannot size the buffer
+        // itself should reach for.
+        let fragment = MailboxFragment {
+            header: EoeHeader::new(FrameType::FragData, 0),
+            counter: 1,
+            data: &[0u8; 32],
+        };
+
+        let mut buffer = [0u8; 41];
+
+        assert_eq!(
+            fragment.pack_to_slice(&mut buffer),
+            Err(WireError::WriteBufferTooShort)
+        );
     }
 }

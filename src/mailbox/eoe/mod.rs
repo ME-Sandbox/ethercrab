@@ -4,6 +4,9 @@
 //! function it was derived from, and the byte sequences are computed from those macros
 //! rather than read off a description of the protocol.
 
+use core::net::Ipv4Addr;
+use ethercrab_wire::WireError;
+
 /// EoE frame type, the low four bits of the first header word.
 ///
 /// Ported from `libs/SOEM/include/soem/ec_eoe.h`: the `EOE_FRAG_DATA` …
@@ -292,6 +295,183 @@ impl EoeHeader {
 
         self
     }
+}
+
+/// IP parameters of a SubDevice, as carried by a Set-IP request or a Get-IP response.
+///
+/// Ported from `ecx_EOEsetIp` and `ecx_EOEgetIp` (`libs/SOEM/src/ec_eoe.c:74-138`,
+/// `:187-300`). The payload is a byte of include flags followed by exactly the fields
+/// those flags name, in flag order:
+///
+/// ```text
+/// data[0]      include flags        EOE_PARAM_*, ec_eoe.h:102-107
+/// data[1..4]   reserved             fields start at EOE_PARAM_OFFSET = 4
+/// data[4..]    MAC 6, IP 4, subnet 4, gateway 4, DNS IP 4, DNS name 32
+/// ```
+///
+/// Two things about it are easy to get wrong and expensive to debug:
+///
+/// * **IPv4 addresses go on the wire backwards.** `EOE_ip_uint32_to_byte`
+///   (`ec_eoe.c:26-32`) writes `byte_ip[3]` from the *first* octet, so `192.168.1.10` is
+///   the bytes `10, 1, 168, 192`.
+/// * **The DNS name always occupies 32 bytes**, zero padded, however short it is -
+///   `ec_eoe.c:131` copies `EOE_DNS_NAME_LENGTH` unconditionally, with the comment
+///   "TwinCAT include EOE_DNS_NAME_LENGTH chars even if name is shorter".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct IpParam {
+    /// MAC address.
+    pub mac: Option<[u8; 6]>,
+    /// IPv4 address.
+    pub ip: Option<Ipv4Addr>,
+    /// Subnet mask.
+    pub subnet: Option<Ipv4Addr>,
+    /// Default gateway.
+    pub gateway: Option<Ipv4Addr>,
+    /// DNS server address.
+    pub dns_ip: Option<Ipv4Addr>,
+    /// DNS name. At most [`IpParam::DNS_NAME_LENGTH`] bytes.
+    pub dns_name: Option<heapless::String<{ IpParam::DNS_NAME_LENGTH }>>,
+}
+
+impl IpParam {
+    /// `EOE_DNS_NAME_LENGTH`. The field is always this wide on the wire.
+    pub const DNS_NAME_LENGTH: usize = 32;
+
+    /// `EOE_PARAM_OFFSET`: the flags byte plus three reserved bytes.
+    const FIELDS_START: usize = 4;
+
+    const MAC: (u8, usize) = (0x01, 6);
+    const IP: (u8, usize) = (0x02, 4);
+    const SUBNET: (u8, usize) = (0x04, 4);
+    const GATEWAY: (u8, usize) = (0x08, 4);
+    const DNS_IP: (u8, usize) = (0x10, 4);
+    const DNS_NAME: (u8, usize) = (0x20, Self::DNS_NAME_LENGTH);
+
+    /// Writes the payload into `buffer` and returns the part of it that was used.
+    ///
+    /// # Errors
+    ///
+    /// [`WireError`] if `buffer` is too small for the flags word plus every field that is
+    /// set.
+    pub fn pack_to<'buf>(&self, buffer: &'buf mut [u8]) -> Result<&'buf [u8], WireError> {
+        let mut flags = 0u8;
+        let mut at = Self::FIELDS_START;
+
+        let mut put = |(flag, width): (u8, usize), bytes: &[u8]| -> Result<(), WireError> {
+            let field = buffer
+                .get_mut(at..at + width)
+                .ok_or(WireError::WriteBufferTooShort)?;
+
+            // Zero first: a DNS name shorter than the field must be padded, not left with
+            // whatever the caller's buffer happened to hold.
+            field.fill(0);
+            field
+                .get_mut(..bytes.len())
+                .ok_or(WireError::WriteBufferTooShort)?
+                .copy_from_slice(bytes);
+
+            flags |= flag;
+            at += width;
+
+            Ok(())
+        };
+
+        if let Some(mac) = &self.mac {
+            put(Self::MAC, mac)?;
+        }
+        for (field, value) in [
+            (Self::IP, self.ip),
+            (Self::SUBNET, self.subnet),
+            (Self::GATEWAY, self.gateway),
+            (Self::DNS_IP, self.dns_ip),
+        ] {
+            if let Some(address) = value {
+                put(field, &reversed(address))?;
+            }
+        }
+        if let Some(name) = &self.dns_name {
+            put(Self::DNS_NAME, name.as_bytes())?;
+        }
+
+        let used = buffer.get_mut(..at).ok_or(WireError::WriteBufferTooShort)?;
+
+        // The flags byte is only known once every field has been seen.
+        *used.first_mut().ok_or(WireError::WriteBufferTooShort)? = flags;
+        used.get_mut(1..Self::FIELDS_START)
+            .ok_or(WireError::WriteBufferTooShort)?
+            .fill(0);
+
+        Ok(used)
+    }
+
+    /// Reads the payload of a Set-IP request or a Get-IP response.
+    ///
+    /// # Errors
+    ///
+    /// [`WireError`] if the payload ends before a field its own flags promised.
+    pub fn unpack(payload: &[u8]) -> Result<Self, WireError> {
+        let flags = *payload.first().ok_or(WireError::ReadBufferTooShort)?;
+        let mut at = Self::FIELDS_START;
+
+        let mut take = |(flag, width): (u8, usize)| -> Result<Option<&[u8]>, WireError> {
+            if flags & flag == 0 {
+                return Ok(None);
+            }
+
+            let field = payload
+                .get(at..at + width)
+                .ok_or(WireError::ReadBufferTooShort)?;
+            at += width;
+
+            Ok(Some(field))
+        };
+
+        let mac = take(Self::MAC)?
+            .map(|bytes| bytes.try_into().map_err(|_| WireError::ReadBufferTooShort))
+            .transpose()?;
+
+        let mut address = |field| -> Result<Option<Ipv4Addr>, WireError> {
+            Ok(take(field)?
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .map(|bytes| Ipv4Addr::new(bytes[3], bytes[2], bytes[1], bytes[0])))
+        };
+
+        let ip = address(Self::IP)?;
+        let subnet = address(Self::SUBNET)?;
+        let gateway = address(Self::GATEWAY)?;
+        let dns_ip = address(Self::DNS_IP)?;
+
+        let dns_name = take(Self::DNS_NAME)?
+            .map(|bytes| {
+                // Zero padded on the wire; the trailing zeroes are not part of the name.
+                let end = bytes
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(bytes.len());
+                let text = core::str::from_utf8(bytes.get(..end).unwrap_or_default())
+                    .map_err(|_| WireError::ReadBufferTooShort)?;
+
+                heapless::String::try_from(text).map_err(|()| WireError::ReadBufferTooShort)
+            })
+            .transpose()?;
+
+        Ok(Self {
+            mac,
+            ip,
+            subnet,
+            gateway,
+            dns_ip,
+            dns_name,
+        })
+    }
+}
+
+/// An IPv4 address in the byte order EoE puts it on the wire: last octet first.
+fn reversed(address: Ipv4Addr) -> [u8; 4] {
+    let [a, b, c, d] = address.octets();
+
+    [d, c, b, a]
 }
 
 #[cfg(test)]
@@ -644,5 +824,127 @@ mod tests {
 
             Ok(())
         });
+    }
+}
+
+#[cfg(test)]
+mod ip_param_tests {
+    use super::*;
+
+    /// Ported from `ecx_EOEsetIp`, `libs/SOEM/src/ec_eoe.c:74-138`.
+    ///
+    /// The payload of a Set-IP request:
+    ///
+    /// ```text
+    /// data[0]      include flags     EOE_PARAM_* , ec_eoe.h:102-107
+    /// data[1..4]   reserved          data_offset starts at EOE_PARAM_OFFSET = 4
+    /// data[4..]    the included fields, in flag order:
+    ///              MAC 6, IP 4, subnet 4, gateway 4, DNS IP 4, DNS name 32
+    /// ```
+    ///
+    /// The DNS name always occupies 32 bytes even when shorter - `ec_eoe.c:131` copies
+    /// `EOE_DNS_NAME_LENGTH` unconditionally, with the comment "TwinCAT include
+    /// EOE_DNS_NAME_LENGTH chars even if name is shorter".
+    #[test]
+    fn an_ip_and_a_subnet_pack_into_the_payload_soem_would_write() {
+        let param = IpParam {
+            ip: Some(Ipv4Addr::new(192, 168, 1, 10)),
+            subnet: Some(Ipv4Addr::new(255, 255, 255, 0)),
+            ..IpParam::default()
+        };
+
+        let mut buffer = [0u8; 12];
+        let written = param
+            .pack_to(&mut buffer)
+            .expect("room for flags plus two addresses");
+
+        assert_eq!(
+            written,
+            &[
+                0x06, // IP_INCLUDE | SUBNET_IP_INCLUDE
+                0x00, 0x00, 0x00, // reserved up to EOE_PARAM_OFFSET
+                10, 1, 168, 192, // 192.168.1.10, last octet first
+                0, 255, 255, 255, // 255.255.255.0, last octet first
+            ]
+        );
+    }
+
+    #[test]
+    fn an_address_goes_on_the_wire_backwards() {
+        // `EOE_ip_uint32_to_byte` (`ec_eoe.c:26-32`) writes byte_ip[3] = 1st octet. Getting
+        // this the usual way round turns 192.168.1.10 into 10.1.168.192 - a device that
+        // answers on neither address and a fault nobody traces back to four bytes.
+        let param = IpParam {
+            ip: Some(Ipv4Addr::new(1, 2, 3, 4)),
+            ..IpParam::default()
+        };
+
+        let mut buffer = [0u8; 8];
+        let written = param.pack_to(&mut buffer).expect("room");
+
+        assert_eq!(&written[4..8], &[4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn a_dns_name_occupies_thirty_two_bytes_however_short_it_is() {
+        let param = IpParam {
+            dns_name: Some(heapless::String::try_from("edge").expect("fits")),
+            ..IpParam::default()
+        };
+
+        let mut buffer = [0u8; 40];
+        let written = param.pack_to(&mut buffer).expect("room");
+
+        assert_eq!(written.len(), 4 + 32, "flags word plus the full name field");
+        assert_eq!(&written[4..8], b"edge");
+        assert!(
+            written[8..].iter().all(|byte| *byte == 0),
+            "the rest of the field is zero, not omitted"
+        );
+    }
+
+    #[test]
+    fn nothing_set_is_a_flags_word_and_no_fields() {
+        let mut buffer = [0u8; 8];
+        let written = IpParam::default().pack_to(&mut buffer).expect("room");
+
+        assert_eq!(written, &[0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn what_was_packed_comes_back_out() {
+        let param = IpParam {
+            mac: Some([0x02, 0x00, 0x00, 0x11, 0x22, 0x33]),
+            ip: Some(Ipv4Addr::new(10, 0, 0, 42)),
+            subnet: Some(Ipv4Addr::new(255, 0, 0, 0)),
+            gateway: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            dns_ip: Some(Ipv4Addr::new(8, 8, 8, 8)),
+            dns_name: Some(heapless::String::try_from("murr").expect("fits")),
+        };
+
+        let mut buffer = [0u8; 64];
+        let written = param.pack_to(&mut buffer).expect("room");
+
+        assert_eq!(IpParam::unpack(written), Ok(param));
+    }
+
+    #[test]
+    fn a_payload_that_stops_short_is_an_error_and_not_a_panic() {
+        // A device that sets a flag and then truncates the frame must not take us down.
+        let claims_an_ip = [0x02, 0x00, 0x00, 0x00, 10, 0];
+
+        assert!(IpParam::unpack(&claims_an_ip).is_err());
+        assert!(IpParam::unpack(&[]).is_err(), "not even the flags word");
+    }
+
+    #[test]
+    fn a_buffer_too_small_to_write_into_is_an_error_and_not_a_panic() {
+        let param = IpParam {
+            ip: Some(Ipv4Addr::new(1, 1, 1, 1)),
+            ..IpParam::default()
+        };
+
+        let mut buffer = [0u8; 7];
+        assert!(param.pack_to(&mut buffer).is_err());
     }
 }

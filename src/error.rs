@@ -112,23 +112,7 @@ impl core::fmt::Display for Error {
             }
             Error::Timeout(kind) => write!(f, "timeout: {}", kind),
             Error::Eeprom(e) => write!(f, "eeprom: {}", e),
-            Error::Fragment(e) => match e {
-                FragmentError::MailboxTooSmall { capacity } => write!(
-                    f,
-                    "mailbox of {} bytes cannot carry a whole 32 byte EoE block",
-                    capacity
-                ),
-                FragmentError::FrameTooLong { length, limit } => write!(
-                    f,
-                    "ethernet frame of {} bytes is longer than the {} an EoE offset can name",
-                    length, limit
-                ),
-                FragmentError::TooWideForItsField { value, what } => write!(
-                    f,
-                    "{:?} {} does not fit the four bits EoE gives it",
-                    what, value
-                ),
-            },
+            Error::Fragment(e) => write!(f, "eoe fragment: {}", e),
             Error::Capacity(item) => write!(f, "not enough capacity for {:?}", item),
             Error::StringTooLong {
                 max_length,

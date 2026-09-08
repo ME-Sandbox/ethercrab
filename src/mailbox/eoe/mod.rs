@@ -210,6 +210,10 @@ impl EoeHeader {
     const FRAME_NO: (u16, u16) = (0x000F, 12);
 
     /// A header for the given frame type and port, with an empty second word.
+    ///
+    /// `port` is a four bit field and is **masked**, not checked: this is the raw header
+    /// type. [`Fragments::new`](crate::Fragments::new) rejects a port that does not fit,
+    /// and is the way to build fragments.
     pub fn new(frame_type: FrameType, port: u8) -> Self {
         Self {
             frame_type,
@@ -277,8 +281,9 @@ impl EoeHeader {
     /// Set fragment number, offset-or-size and frame number.
     ///
     /// Ported from the `EOE_HDR_*_SET` macros: each value is masked to its own width, so a
-    /// value too large for its field cannot spill into a neighbour. `raw_offset` is in
-    /// units of 32 bytes and means the frame size on fragment zero - see [`Fragment`].
+    /// value too large for its field cannot spill into a neighbour - but it is **not**
+    /// reported either, so `frame_number` 16 goes out as 0. `raw_offset` is in units of 32
+    /// bytes and means the frame size on fragment zero - see [`Fragment`].
     pub fn with_fragment(mut self, number: u8, raw_offset: u8, frame_number: u8) -> Self {
         let put = |(mask, shift): (u16, u16), value: u8| (u16::from(value) & mask) << shift;
 
@@ -510,6 +515,8 @@ pub enum FragmentError {
     MailboxTooSmall {
         /// EoE payload capacity of the mailbox, in bytes.
         capacity: usize,
+        /// Length of the frame that would have had to be split, in bytes.
+        length: usize,
     },
     /// The frame is longer than a six bit offset can name.
     ///
@@ -523,28 +530,39 @@ pub enum FragmentError {
         /// The largest length that can be expressed.
         limit: usize,
     },
-    /// A frame number or port does not fit its four bit field.
+    /// The port does not fit the four bits EoE gives it.
     ///
-    /// Masking it silently, as the `EOE_HDR_*_SET` macros do, would put frame 16 on the
-    /// wire as frame 0 and collide with the frame before it.
-    TooWideForItsField {
-        /// The value that was offered.
-        value: u8,
-        /// Which field it was for.
-        what: Nibble,
+    /// Unlike the frame number - a counter the reference implementation deliberately lets
+    /// wrap - a port index above 15 is a mistake, and masking it would send the frame to
+    /// a different port than the caller asked for.
+    PortTooWide {
+        /// The port that was asked for.
+        port: u8,
     },
 }
 
-/// A four bit header field, named for [`FragmentError::TooWideForItsField`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-pub enum Nibble {
-    /// The frame number, which identifies one Ethernet frame across its fragments.
-    FrameNumber,
-    /// The port of the SubDevice.
-    Port,
+impl core::fmt::Display for FragmentError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MailboxTooSmall { capacity, length } => write!(
+                f,
+                "a {} byte frame must be split, and a mailbox of {} bytes cannot carry a whole 32 byte block",
+                length, capacity
+            ),
+            Self::FrameTooLong { length, limit } => write!(
+                f,
+                "an ethernet frame of {} bytes is longer than the {} bytes an EoE offset can name",
+                length, limit
+            ),
+            Self::PortTooWide { port } => {
+                write!(f, "port {} does not fit the four bits EoE gives it", port)
+            }
+        }
+    }
 }
+
+#[cfg(feature = "std")]
+impl std::error::Error for FragmentError {}
 
 /// Splits an Ethernet frame into EoE fragments.
 ///
@@ -586,8 +604,14 @@ impl<'a> Fragments<'a> {
     ///
     /// `frame_number` identifies this frame at the receiver and has to differ from the
     /// frame before it; it is **not** advanced here, because a counter is state and this
-    /// is an iterator over borrowed data. In the reference implementation it is a `static`
-    /// bumped once per frame (`ec_eoe.c:392`), so the caller now owns that.
+    /// is an iterator over borrowed data. In the reference implementation it is a `static
+    /// uint8_t` bumped once per frame (`ec_eoe.c:341`, `:392`), so the caller now owns it.
+    ///
+    /// Only its low four bits reach the wire, so it repeats every 16 frames. That is the
+    /// reference implementation's own behaviour - `:394` hands the unmasked counter to
+    /// `EOE_HDR_FRAME_NO_SET`, which masks it - and it is harmless, because the fragments
+    /// of one frame follow each other. A plain `u8` counter is therefore the right thing
+    /// to pass, and is not rejected when it passes 15.
     ///
     /// # Errors
     ///
@@ -600,27 +624,30 @@ impl<'a> Fragments<'a> {
         frame_number: u8,
         port: u8,
     ) -> Result<Self, FragmentError> {
-        for (value, what) in [(frame_number, Nibble::FrameNumber), (port, Nibble::Port)] {
-            if value > Self::MAX_NIBBLE {
-                return Err(FragmentError::TooWideForItsField { value, what });
-            }
+        if port > Self::MAX_NIBBLE {
+            return Err(FragmentError::PortTooWide { port });
         }
 
         // Rounded down, as `((maxdata >> 5) << 5)` does - a fragment that is not a whole
         // number of blocks would give the next one an offset the field cannot express.
         let block = (capacity / Self::BLOCK) * Self::BLOCK;
 
-        // Only a frame that actually has to be split needs whole blocks. A mailbox of 40
-        // bytes carries a 10 byte frame perfectly well, and the reference implementation
-        // sends it - rejecting it outright would make such a SubDevice unusable for EoE.
-        if block == 0 && frame.len() > capacity {
-            return Err(FragmentError::MailboxTooSmall { capacity });
-        }
-
+        // Length first: it is the more specific answer. A 3000 byte frame offered to a
+        // 31 byte mailbox is too long whatever the mailbox does.
         if frame.len() > Self::MAX_FRAME {
             return Err(FragmentError::FrameTooLong {
                 length: frame.len(),
                 limit: Self::MAX_FRAME,
+            });
+        }
+
+        // Only a frame that actually has to be split needs whole blocks. A mailbox of 40
+        // bytes carries a 10 byte frame perfectly well, and the reference implementation
+        // sends it - rejecting it outright would make such a SubDevice unusable for EoE.
+        if block == 0 && frame.len() > capacity {
+            return Err(FragmentError::MailboxTooSmall {
+                capacity,
+                length: frame.len(),
             });
         }
 
@@ -1414,27 +1441,67 @@ mod fragment_tests {
     }
 
     #[test]
-    fn a_frame_number_or_port_that_does_not_fit_four_bits_is_rejected() {
-        // `EOE_HDR_FRAME_NO_SET` masks with 0xF. Frame 16 would go out as frame 0 and
-        // collide with the frame before it at any receiver that de-duplicates by number.
-        assert_eq!(
-            Fragments::new(&[0u8; 4], 64, 16, 0).unwrap_err(),
-            FragmentError::TooWideForItsField {
-                value: 16,
-                what: Nibble::FrameNumber
-            }
-        );
+    #[test]
+    fn a_port_that_does_not_fit_four_bits_is_rejected() {
+        // Masking would send the frame to a different port than the caller asked for.
         assert_eq!(
             Fragments::new(&[0u8; 4], 64, 0, 255).unwrap_err(),
-            FragmentError::TooWideForItsField {
-                value: 255,
-                what: Nibble::Port
-            }
+            FragmentError::PortTooWide { port: 255 }
         );
         assert!(
-            Fragments::new(&[0u8; 4], 64, 15, 15).is_ok(),
+            Fragments::new(&[0u8; 4], 64, 0, 15).is_ok(),
             "15 still fits"
         );
+    }
+
+    #[test]
+    fn a_frame_number_past_fifteen_is_masked_and_not_rejected() {
+        // `ec_eoe.c:341` declares `static uint8_t txframeno`, `:392` bumps it without
+        // bound and `:394` hands it UNMASKED to EOE_HDR_FRAME_NO_SET. So a plain `u8`
+        // counter is exactly what a caller should pass, and rejecting it on the
+        // seventeenth frame would break the obvious port of the reference loop.
+        let (header, _) = Fragments::new(&[0u8; 4], 64, 17, 0)
+            .expect("a counter is allowed to pass fifteen")
+            .next()
+            .expect("one fragment");
+
+        assert_eq!(
+            header.fragment().expect("data frame").frame_number,
+            1,
+            "17 wraps to 1, as the field is four bits wide"
+        );
+    }
+
+    #[test]
+    fn a_frame_exactly_the_size_of_a_small_mailbox_is_sent_whole() {
+        // The boundary the earlier test missed: `frame.len() == capacity` needs no
+        // splitting, so a mailbox that holds no whole block is still fine.
+        let sizes: Vec<_> = Fragments::new(&[0u8; 31], 31, 0, 0)
+            .expect("exactly fits")
+            .map(|(_, data)| data.len())
+            .collect();
+
+        assert_eq!(sizes, vec![31]);
+        assert!(
+            Fragments::new(&[0u8; 32], 31, 0, 0).is_err(),
+            "one byte more has to be split, and cannot be"
+        );
+    }
+
+    #[test]
+    fn the_error_says_which_frame_could_not_be_split() {
+        assert_eq!(
+            Fragments::new(&[0u8; 100], 31, 0, 0).unwrap_err(),
+            FragmentError::MailboxTooSmall {
+                capacity: 31,
+                length: 100
+            }
+        );
+        // Length is checked first: too long is the more specific answer.
+        assert!(matches!(
+            Fragments::new(&[0u8; 3000], 31, 0, 0).unwrap_err(),
+            FragmentError::FrameTooLong { .. }
+        ));
     }
 
     #[test]

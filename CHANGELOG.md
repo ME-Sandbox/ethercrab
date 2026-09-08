@@ -37,8 +37,8 @@ A pure Rust EtherCAT MainDevice supporting std and no_std environments.
   refuses, all of which the reference implementation lets through: a mailbox too small to
   carry one 32 byte block of a frame that has to be split (which loops there for as long as
   the sends keep succeeding), a frame longer than the six bit offset field can name, and a
-  frame number or port too wide for its four bit field - which the `EOE_HDR_*_SET` macros
-  mask silently, so frame 16 would go out as frame 0.
+  port too wide for its four bit field. The frame number is *not* rejected when it passes
+  15 - it is a counter the reference implementation deliberately lets the field wrap.
 
 ## [0.7.1] - 2026-03-23
 

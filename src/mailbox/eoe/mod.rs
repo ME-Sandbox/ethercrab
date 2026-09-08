@@ -945,6 +945,11 @@ impl<'buf> Reassembly<'buf> {
         })
     }
 
+    /// The port this reassembly is for.
+    pub fn port(&self) -> u8 {
+        self.port
+    }
+
     /// What is half assembled, if anything.
     ///
     /// `None` right after a frame completes, or before the first fragment of the next one.
@@ -959,9 +964,12 @@ impl<'buf> Reassembly<'buf> {
 
     /// Throws away a half assembled frame and reports what it was.
     ///
-    /// This is the timeout: a SubDevice that stops mid-frame leaves the fragments so far
-    /// in place for ever otherwise, and the next frame's fragment zero would be the only
-    /// thing that clears them. `None` if there was nothing to throw away.
+    /// This is the timeout, **and the caller owns the clock**: nothing here measures time,
+    /// because nothing here can in `no_std`. A SubDevice that stops mid-frame otherwise
+    /// leaves the fragments so far in place for ever, and the next frame's fragment zero
+    /// would be the only thing that clears them.
+    ///
+    /// `None` if there was nothing to throw away.
     pub fn abandon(&mut self) -> Option<InProgress> {
         let was = self.in_progress();
         self.frame = None;
@@ -970,6 +978,18 @@ impl<'buf> Reassembly<'buf> {
     }
 
     /// Adds one fragment.
+    ///
+    /// A **fragment zero discards whatever was half assembled** and starts over, without
+    /// saying so: a SubDevice that gives up on a frame simply begins the next one, and
+    /// refusing that would wedge the link. A caller that wants to know calls
+    /// [`in_progress`](Self::in_progress) first.
+    ///
+    /// An **error leaves the half assembled frame in place**, so a stray fragment cannot
+    /// destroy a good one. This is a deliberate difference from the stateful reference
+    /// function, which zeroes its state on a fragment, frame or offset mismatch
+    /// (`ec_eoe.c:585-601`, `:613-620`, `:622-631`); there the caller owns the variables
+    /// and has nothing else to reset them with. Here [`abandon`](Self::abandon) is that
+    /// something, and it is the caller's to time.
     ///
     /// # Errors
     ///
@@ -998,7 +1018,12 @@ impl<'buf> Reassembly<'buf> {
         // gives up on one simply begins the next. Refusing it would wedge the link, and
         // the reference implementation lets it through as well - only to fail it one check
         // later on the frame number, which names the wrong problem (`ec_eoe.c:467-476`).
-        if fragment.number == 0 {
+        //
+        // Nothing is written to `self.frame` here. Every check below runs against a local
+        // copy, and the state is committed only once the fragment has actually landed: a
+        // fragment zero that is then rejected would otherwise leave a frame behind that
+        // never began, and take the real one with it.
+        let mut partial = if fragment.number == 0 {
             let announced = usize::from(fragment.total_frame_size().unwrap_or_default());
 
             if announced > self.buffer.len() {
@@ -1008,18 +1033,18 @@ impl<'buf> Reassembly<'buf> {
                 });
             }
 
-            self.frame = Some(Partial {
+            Partial {
                 number: fragment.frame_number,
                 next_fragment: 0,
                 filled: 0,
                 announced,
-            });
-        }
-
-        let mut partial = self.frame.ok_or(ReassemblyError::OutOfOrder {
-            expected: 0,
-            received: fragment.number,
-        })?;
+            }
+        } else {
+            self.frame.ok_or(ReassemblyError::OutOfOrder {
+                expected: 0,
+                received: fragment.number,
+            })?
+        };
 
         if fragment.number != partial.next_fragment {
             return Err(ReassemblyError::OutOfOrder {
@@ -2414,6 +2439,93 @@ mod reassembly_tests {
 
         assert_eq!(reassembly.abandon(), Some(progress));
         assert_eq!(reassembly.in_progress(), None, "and it is gone");
+    }
+
+    #[test]
+    fn a_rejected_fragment_zero_leaves_no_phantom_behind() {
+        // A fragment zero that is then rejected must not replace the frame in progress
+        // with one that never began: a timeout poller would abandon a frame the device
+        // never sent a byte of, and the 96 real bytes would be gone unreported.
+        let frame = [0u8; 250];
+        let mut buffer = [0u8; 512];
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
+        let parts = sent(&frame, 118, 7);
+
+        reassembly
+            .push(parts[0].0, &parts[0].1)
+            .expect("fragment zero");
+        let before = reassembly.in_progress().expect("half a frame");
+
+        // Announces 32 bytes and then sends 40.
+        let liar = EoeHeader::new(FrameType::FragData, 0).with_fragment(0, 1, 9);
+        assert!(reassembly.push(liar, &[0u8; 40]).is_err());
+
+        assert_eq!(
+            reassembly.in_progress(),
+            Some(before),
+            "the real frame is untouched, and no phantom took its place"
+        );
+    }
+
+    #[test]
+    fn the_next_fragment_due_is_reported() {
+        // Nothing asserted this field, so it could have carried anything.
+        let frame = [0u8; 250];
+        let mut buffer = [0u8; 512];
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
+        let parts = sent(&frame, 118, 0);
+
+        reassembly
+            .push(parts[0].0, &parts[0].1)
+            .expect("fragment zero");
+        assert_eq!(
+            reassembly
+                .in_progress()
+                .expect("half a frame")
+                .next_fragment,
+            1
+        );
+
+        reassembly
+            .push(parts[1].0, &parts[1].1)
+            .expect("fragment one");
+        assert_eq!(
+            reassembly
+                .in_progress()
+                .expect("half a frame")
+                .next_fragment,
+            2
+        );
+    }
+
+    #[test]
+    fn a_frame_that_filled_its_announcement_can_still_be_abandoned() {
+        // A device may fill exactly what it announced and then stop without setting
+        // `last_fragment`. The frame is complete by the numbers and unfinished by the
+        // protocol - and it still has to be abandonable, or it sits there for ever.
+        let mut buffer = [0u8; 128];
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
+
+        let full = EoeHeader::new(FrameType::FragData, 0).with_fragment(0, 2, 0);
+        reassembly
+            .push(full, &[0u8; 64])
+            .expect("exactly the announcement");
+
+        let progress = reassembly.in_progress().expect("still unfinished");
+        assert_eq!(progress.received, progress.announced, "full, but not last");
+
+        assert_eq!(reassembly.abandon(), Some(progress));
+        assert_eq!(reassembly.in_progress(), None);
+    }
+
+    #[test]
+    fn a_reassembly_knows_its_own_port() {
+        let mut buffer = [0u8; 64];
+
+        assert_eq!(
+            Reassembly::new(&mut buffer, 3).expect("a real port").port(),
+            3
+        );
     }
 
     #[test]

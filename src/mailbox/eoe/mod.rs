@@ -211,9 +211,11 @@ impl EoeHeader {
 
     /// A header for the given frame type and port, with an empty second word.
     ///
-    /// `port` is a four bit field and is **masked**, not checked: this is the raw header
-    /// type. [`Fragments::new`](crate::Fragments::new) rejects a port that does not fit,
-    /// and is the way to build fragments.
+    /// `port` is a four bit field. This is the raw header type, so nothing is checked
+    /// here: the value is kept as given and only **the wire** truncates it, at pack time -
+    /// a header built with port 255 still reads back 255 and goes out as 15.
+    /// [`Fragments::new`](crate::Fragments::new) rejects such a port, and is the way to
+    /// build fragments.
     pub fn new(frame_type: FrameType, port: u8) -> Self {
         Self {
             frame_type,
@@ -596,7 +598,7 @@ impl<'a> Fragments<'a> {
     /// The longest frame whose size and offsets both fit the six bit field.
     pub const MAX_FRAME: usize = Self::MAX_BLOCKS * Self::BLOCK;
 
-    /// The frame number and the port are four bit fields.
+    /// The port is a four bit field.
     const MAX_NIBBLE: u8 = 0x0F;
 
     /// Prepares to split `frame` for a mailbox that can carry `capacity` bytes of EoE
@@ -616,8 +618,8 @@ impl<'a> Fragments<'a> {
     /// # Errors
     ///
     /// [`FragmentError`] if the mailbox cannot carry a whole block of a frame that has to
-    /// be split, the frame is longer than the offset field can name, or the frame number
-    /// or port does not fit its four bit field.
+    /// be split, the frame is longer than the offset field can name, or the port does not
+    /// fit its four bit field. The frame number is masked, not rejected - see above.
     pub fn new(
         frame: &'a [u8],
         capacity: usize,
@@ -1440,7 +1442,6 @@ mod fragment_tests {
         assert_eq!(sizes, vec![10]);
     }
 
-    #[test]
     #[test]
     fn a_port_that_does_not_fit_four_bits_is_rejected() {
         // Masking would send the frame to a different port than the caller asked for.

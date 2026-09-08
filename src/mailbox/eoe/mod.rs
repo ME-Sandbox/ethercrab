@@ -946,6 +946,9 @@ impl<'buf> Reassembly<'buf> {
     }
 
     /// The port this reassembly is for.
+    ///
+    /// Nothing here needs it - it is for a caller holding one reassembly per port that
+    /// wants to name the port in a log line without threading it separately.
     pub fn port(&self) -> u8 {
         self.port
     }
@@ -985,11 +988,16 @@ impl<'buf> Reassembly<'buf> {
     /// [`in_progress`](Self::in_progress) first.
     ///
     /// An **error leaves the half assembled frame in place**, so a stray fragment cannot
-    /// destroy a good one. This is a deliberate difference from the stateful reference
-    /// function, which zeroes its state on a fragment, frame or offset mismatch
-    /// (`ec_eoe.c:585-601`, `:613-620`, `:622-631`); there the caller owns the variables
-    /// and has nothing else to reset them with. Here [`abandon`](Self::abandon) is that
-    /// something, and it is the caller's to time.
+    /// destroy a good one - with one exception: a last fragment that promises a timestamp
+    /// and is too short for one ends the frame either way, because the last fragment has
+    /// been consumed and nothing can follow it.
+    ///
+    /// This is a deliberate difference from the stateful reference function, which zeroes
+    /// its state on a fragment, frame or offset mismatch (`ec_eoe.c:585-601`, `:612-621`,
+    /// `:623-632`). It can afford to: it is a mailbox hook with no notion of a partial
+    /// frame outliving a call, so resetting on any surprise is its only recovery. Here the
+    /// partial is a visible thing with [`in_progress`](Self::in_progress) and
+    /// [`abandon`](Self::abandon), and the caller owns the clock.
     ///
     /// # Errors
     ///

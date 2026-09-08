@@ -49,6 +49,7 @@ A pure Rust EtherCAT MainDevice supporting std and no_std environments.
   equivalent for: it keeps its state in local variables, so a timeout on the mailbox read
   ends the call and the half frame ceases to exist. A push driven reassembly outlives the
   wait, so the caller decides when to give up - and is told what it gave up on.
+  `Reassembly::port` names the port a reassembly belongs to.
 
 ## [0.7.1] - 2026-03-23
 

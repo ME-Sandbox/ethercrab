@@ -324,8 +324,12 @@ impl EoeHeader {
 /// * **The DNS name always occupies 32 bytes**, zero padded, however short it is -
 ///   `ec_eoe.c:131` copies `EOE_DNS_NAME_LENGTH` unconditionally, with the comment
 ///   "TwinCAT include EOE_DNS_NAME_LENGTH chars even if name is shorter".
+// No `defmt::Format`: `core::net::Ipv4Addr` does not implement it, so the derive cannot
+// see through `Option<Ipv4Addr>`. A hand written impl would have to spell out five fields
+// as octet arrays; until a defmt user asks for it, saying so is better than a derive that
+// does not compile - which is what stood here, unnoticed, because the gate does not build
+// this feature.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct IpParam {
     /// MAC address.
     pub mac: Option<[u8; 6]>,
@@ -595,7 +599,7 @@ impl<'a> Fragments<'a> {
     pub const MAX_FRAME: usize = Self::MAX_BLOCKS * Self::BLOCK;
 
     /// The port is a four bit field.
-    const MAX_NIBBLE: u8 = 0x0F;
+    pub(crate) const MAX_NIBBLE: u8 = 0x0F;
 
     /// Prepares to split `frame` for a mailbox that can carry `capacity` bytes of EoE
     /// payload.
@@ -864,6 +868,7 @@ pub struct Reassembly<'buf> {
 
 /// The frame currently being put back together.
 #[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 struct Partial {
     number: u8,
     next_fragment: u8,
@@ -881,12 +886,22 @@ impl<'buf> Reassembly<'buf> {
     ///
     /// The port is not decoration: a SubDevice with two ports can fragment on both at
     /// once, and without it the two frames splice into one, half of each.
-    pub fn new(buffer: &'buf mut [u8], port: u8) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// [`FragmentError::PortTooWide`] if `port` does not fit the four bits EoE gives it -
+    /// such a reassembly would reject every fragment off the wire and never say why.
+    /// [`Fragments::new`] refuses the same value.
+    pub fn new(buffer: &'buf mut [u8], port: u8) -> Result<Self, FragmentError> {
+        if port > Fragments::MAX_NIBBLE {
+            return Err(FragmentError::PortTooWide { port });
+        }
+
+        Ok(Self {
             buffer,
             port,
             frame: None,
-        }
+        })
     }
 
     /// Adds one fragment.
@@ -910,14 +925,20 @@ impl<'buf> Reassembly<'buf> {
         // gives up on one simply begins the next. Refusing it would wedge the link, and
         // the reference implementation lets it through as well - only to fail it one check
         // later on the frame number, which names the wrong problem (`ec_eoe.c:467-476`).
-        if fragment.number == 0 {
-            if header.port != self.port {
-                return Err(ReassemblyError::WrongPort {
-                    expected: self.port,
-                    received: header.port,
-                });
-            }
+        // Every fragment, not only fragment zero. The reference implementation checks it
+        // once (`ec_eoe.c:487`), which is enough only when the caller already routes
+        // fragments to the right reassembly. Checking each one makes the guard hold on its
+        // own: two ports fragmenting at the same time both start at frame number zero, so
+        // fragment number, frame number and offset all line up and the halves splice into
+        // one frame without a single error.
+        if header.port != self.port {
+            return Err(ReassemblyError::WrongPort {
+                expected: self.port,
+                received: header.port,
+            });
+        }
 
+        if fragment.number == 0 {
             let announced = usize::from(fragment.total_frame_size().unwrap_or_default());
 
             if announced > self.buffer.len() {
@@ -1014,8 +1035,16 @@ impl<'buf> Reassembly<'buf> {
             partial.filled
         };
 
-        // `length <= filled <= announced <= buffer.len()`, checked on fragment zero.
-        Ok(Reassembled::Frame(self.buffer.get(..length).unwrap_or(&[])))
+        // `length <= filled <= announced <= buffer.len()`, checked on fragment zero. An
+        // empty slice here would hand the caller a zero length ethernet frame instead of
+        // an error, which is the quietest possible way to be wrong.
+        self.buffer
+            .get(..length)
+            .map(Reassembled::Frame)
+            .ok_or(ReassemblyError::Overrun {
+                announced: partial.announced,
+                would_be: length,
+            })
     }
 }
 
@@ -1882,7 +1911,7 @@ mod reassembly_tests {
     fn what_the_sender_split_the_receiver_puts_back() {
         let frame: Vec<u8> = (0..=255u8).cycle().take(1514).collect();
         let mut buffer = [0u8; 2048];
-        let mut reassembly = Reassembly::new(&mut buffer, 0);
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
 
         assert_eq!(feed(&mut reassembly, &sent(&frame, 118, 3)), Some(frame));
     }
@@ -1890,7 +1919,7 @@ mod reassembly_tests {
     #[test]
     fn a_single_fragment_frame_is_complete_at_once() {
         let mut buffer = [0u8; 128];
-        let mut reassembly = Reassembly::new(&mut buffer, 0);
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
         let parts = sent(b"hello", 118, 0);
 
         assert_eq!(parts.len(), 1);
@@ -1906,7 +1935,7 @@ mod reassembly_tests {
         // place. The reference implementation checks this too (`ec_eoe.c:467`).
         let frame = [0u8; 250];
         let mut buffer = [0u8; 512];
-        let mut reassembly = Reassembly::new(&mut buffer, 0);
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
         let parts = sent(&frame, 118, 0);
 
         reassembly
@@ -1927,7 +1956,7 @@ mod reassembly_tests {
         // `ec_eoe.c:496`: mid-frame, the frame number has to keep matching.
         let frame = [0u8; 250];
         let mut buffer = [0u8; 512];
-        let mut reassembly = Reassembly::new(&mut buffer, 0);
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
 
         let ours = sent(&frame, 118, 3);
         let theirs = sent(&frame, 118, 4);
@@ -1950,7 +1979,7 @@ mod reassembly_tests {
         // `ec_eoe.c:502`. Trusting it would leave a hole in the frame.
         let frame = [0u8; 250];
         let mut buffer = [0u8; 512];
-        let mut reassembly = Reassembly::new(&mut buffer, 0);
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
         let parts = sent(&frame, 118, 0);
 
         reassembly
@@ -1974,7 +2003,7 @@ mod reassembly_tests {
         // announces the size - so it can be refused before a single byte is copied.
         let frame = [0u8; 250];
         let mut buffer = [0u8; 64];
-        let mut reassembly = Reassembly::new(&mut buffer, 0);
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
         let parts = sent(&frame, 118, 0);
 
         assert_eq!(
@@ -1995,7 +2024,7 @@ mod reassembly_tests {
         // names the wrong thing.
         let frame = [0u8; 200];
         let mut buffer = [0u8; 512];
-        let mut reassembly = Reassembly::new(&mut buffer, 0);
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
         let parts = sent(&frame, 118, 0);
 
         reassembly
@@ -2020,7 +2049,7 @@ mod reassembly_tests {
         let frame = [1u8; 250];
         let other = [2u8; 40];
         let mut buffer = [0u8; 512];
-        let mut reassembly = Reassembly::new(&mut buffer, 0);
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
 
         let abandoned = sent(&frame, 118, 3);
         let fresh = sent(&other, 118, 4);
@@ -2040,7 +2069,7 @@ mod reassembly_tests {
         // `ec_eoe.c:519-522`: with TIME_APPEND set, the last four bytes are a timestamp
         // and the frame is that much shorter.
         let mut buffer = [0u8; 128];
-        let mut reassembly = Reassembly::new(&mut buffer, 0);
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
 
         let mut header = EoeHeader::new(FrameType::FragData, 0).with_fragment(0, 1, 0);
         header.last_fragment = true;
@@ -2055,7 +2084,7 @@ mod reassembly_tests {
     #[test]
     fn a_timestamp_that_is_not_there_is_an_error() {
         let mut buffer = [0u8; 128];
-        let mut reassembly = Reassembly::new(&mut buffer, 0);
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
 
         let mut header = EoeHeader::new(FrameType::FragData, 0).with_fragment(0, 1, 0);
         header.last_fragment = true;
@@ -2074,7 +2103,7 @@ mod reassembly_tests {
         // these tests but rejects the shortest real one.
         let frame = [7u8; 64];
         let mut buffer = [0u8; 128];
-        let mut reassembly = Reassembly::new(&mut buffer, 0);
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
 
         assert_eq!(
             feed(&mut reassembly, &sent(&frame, 118, 0)),
@@ -2088,7 +2117,7 @@ mod reassembly_tests {
         // is taken as the continuation of a frame that is already gone.
         let frame = [0u8; 40];
         let mut buffer = [0u8; 128];
-        let mut reassembly = Reassembly::new(&mut buffer, 0);
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
         let parts = sent(&frame, 118, 0);
 
         reassembly
@@ -2110,7 +2139,7 @@ mod reassembly_tests {
     fn a_fragment_with_nothing_in_progress_is_rejected() {
         // The ninth check: a device that starts in the middle.
         let mut buffer = [0u8; 128];
-        let mut reassembly = Reassembly::new(&mut buffer, 0);
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
         let orphan = EoeHeader::new(FrameType::FragData, 0).with_fragment(1, 3, 0);
 
         assert_eq!(
@@ -2128,7 +2157,7 @@ mod reassembly_tests {
         // 2 is due names an offset *below* what has been filled.
         let frame = [0u8; 250];
         let mut buffer = [0u8; 512];
-        let mut reassembly = Reassembly::new(&mut buffer, 0);
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
         let parts = sent(&frame, 118, 0);
 
         reassembly
@@ -2154,7 +2183,7 @@ mod reassembly_tests {
         // `ec_eoe.c:487`. Two ports fragmenting at once would otherwise splice into one
         // frame, half of each.
         let mut buffer = [0u8; 512];
-        let mut reassembly = Reassembly::new(&mut buffer, 0);
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
 
         let other_port = EoeHeader::new(FrameType::FragData, 1).with_fragment(0, 4, 0);
 
@@ -2168,9 +2197,95 @@ mod reassembly_tests {
     }
 
     #[test]
+    fn a_second_port_cannot_finish_a_frame_the_first_one_started() {
+        // The splice this guard exists to prevent. Both ports start at frame number zero,
+        // so fragment number, frame number and offset all line up: without a port check on
+        // EVERY fragment, port 1's tail completes port 0's head and a frame goes out that
+        // is half of each, with no error anywhere.
+        let ours = [0xAAu8; 250];
+        let theirs = [0xBBu8; 250];
+        let mut buffer = [0u8; 512];
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
+
+        let mine = sent(&ours, 118, 0);
+        let other: Vec<_> = Fragments::new(&theirs, 118, 0, 1)
+            .expect("fits")
+            .map(|(header, data)| (header, data.to_vec()))
+            .collect();
+
+        reassembly
+            .push(mine[0].0, &mine[0].1)
+            .expect("our fragment zero");
+
+        assert_eq!(
+            reassembly.push(other[1].0, &other[1].1),
+            Err(ReassemblyError::WrongPort {
+                expected: 0,
+                received: 1
+            })
+        );
+    }
+
+    #[test]
+    fn a_wrong_port_leaves_the_frame_in_progress_alone() {
+        // The check has to come before the state is touched. A stray fragment from another
+        // port must not destroy a frame that is halfway assembled.
+        let frame = [0x11u8; 250];
+        let mut buffer = [0u8; 512];
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
+        let parts = sent(&frame, 118, 0);
+
+        reassembly
+            .push(parts[0].0, &parts[0].1)
+            .expect("fragment zero");
+
+        let intruder = EoeHeader::new(FrameType::FragData, 1).with_fragment(0, 8, 0);
+        assert!(reassembly.push(intruder, &[0u8; 96]).is_err());
+
+        // Ours continues as if nothing happened.
+        assert_eq!(
+            feed(&mut reassembly, &parts[1..]),
+            Some(frame.to_vec()),
+            "the interrupted frame still completes"
+        );
+    }
+
+    #[test]
+    fn one_byte_more_than_announced_is_already_an_overrun() {
+        // Every other overrun test overshoots hugely, so nothing pinned the boundary from
+        // above. A 200 byte frame announces 224; after 96 bytes, 129 more is one too many.
+        let frame = [0u8; 200];
+        let mut buffer = [0u8; 512];
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
+        let parts = sent(&frame, 118, 0);
+
+        reassembly
+            .push(parts[0].0, &parts[0].1)
+            .expect("fragment zero");
+
+        assert_eq!(
+            reassembly.push(parts[1].0, &[0u8; 129]),
+            Err(ReassemblyError::Overrun {
+                announced: 224,
+                would_be: 225
+            })
+        );
+    }
+
+    #[test]
+    fn a_reassembly_for_a_port_that_cannot_exist_is_refused() {
+        let mut buffer = [0u8; 64];
+
+        assert_eq!(
+            Reassembly::new(&mut buffer, 200).unwrap_err(),
+            FragmentError::PortTooWide { port: 200 }
+        );
+    }
+
+    #[test]
     fn only_a_data_frame_carries_fragments() {
         let mut buffer = [0u8; 128];
-        let mut reassembly = Reassembly::new(&mut buffer, 0);
+        let mut reassembly = Reassembly::new(&mut buffer, 0).expect("a real port");
         let header = EoeHeader::new(FrameType::InitResp, 0);
 
         assert_eq!(

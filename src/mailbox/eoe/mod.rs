@@ -5,7 +5,7 @@
 //! rather than read off a description of the protocol.
 
 use core::net::Ipv4Addr;
-use ethercrab_wire::WireError;
+use ethercrab_wire::{EtherCrabWireRead, EtherCrabWireWrite, WireError};
 
 /// EoE frame type, the low four bits of the first header word.
 ///
@@ -348,78 +348,95 @@ impl IpParam {
     const DNS_IP: (u8, usize) = (0x10, 4);
     const DNS_NAME: (u8, usize) = (0x20, Self::DNS_NAME_LENGTH);
 
-    /// Writes the payload into `buffer` and returns the part of it that was used.
+    /// The fields this parameter set would write, in flag order.
     ///
-    /// # Errors
-    ///
-    /// [`WireError`] if `buffer` is too small for the flags word plus every field that is
-    /// set.
-    pub fn pack_to<'buf>(&self, buffer: &'buf mut [u8]) -> Result<&'buf [u8], WireError> {
+    /// One source for both [`EtherCrabWireWrite::packed_len`] and the writing itself, so
+    /// the length can never disagree with what is written.
+    fn present(&self) -> impl Iterator<Item = ((u8, usize), Field<'_>)> {
+        [
+            self.mac.as_ref().map(|mac| (Self::MAC, Field::Bytes(mac))),
+            self.ip.map(|ip| (Self::IP, Field::Address(ip))),
+            self.subnet.map(|net| (Self::SUBNET, Field::Address(net))),
+            self.gateway.map(|gw| (Self::GATEWAY, Field::Address(gw))),
+            self.dns_ip.map(|dns| (Self::DNS_IP, Field::Address(dns))),
+            self.dns_name
+                .as_ref()
+                .map(|name| (Self::DNS_NAME, Field::Bytes(name.as_bytes()))),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+/// One field of an [`IpParam`] on its way to the wire.
+///
+/// An address cannot be borrowed as bytes because it has to be reversed first, and the
+/// reversed copy would not outlive the borrow.
+enum Field<'a> {
+    Bytes(&'a [u8]),
+    Address(Ipv4Addr),
+}
+
+impl EtherCrabWireWrite for IpParam {
+    fn pack_to_slice_unchecked<'buf>(&self, buf: &'buf mut [u8]) -> &'buf [u8] {
+        let length = self.packed_len();
+        let buffer = &mut buf[..length];
+
+        // Zero first: the reserved bytes behind the flags, and the padding behind a DNS
+        // name shorter than its field, must be zero rather than whatever the caller's
+        // buffer held.
+        buffer.fill(0);
+
         let mut flags = 0u8;
         let mut at = Self::FIELDS_START;
 
-        let mut put = |(flag, width): (u8, usize), bytes: &[u8]| -> Result<(), WireError> {
-            let field = buffer
-                .get_mut(at..at + width)
-                .ok_or(WireError::WriteBufferTooShort)?;
+        for ((flag, width), field) in self.present() {
+            let bytes = match field {
+                Field::Bytes(bytes) => {
+                    buffer[at..at + bytes.len()].copy_from_slice(bytes);
+                    bytes.len()
+                }
+                Field::Address(address) => {
+                    let [a, b, c, d] = address.octets();
+                    // Last octet first - see the note on `IpParam`.
+                    buffer[at..at + 4].copy_from_slice(&[d, c, b, a]);
+                    4
+                }
+            };
 
-            // Zero first: a DNS name shorter than the field must be padded, not left with
-            // whatever the caller's buffer happened to hold.
-            field.fill(0);
-            field
-                .get_mut(..bytes.len())
-                .ok_or(WireError::WriteBufferTooShort)?
-                .copy_from_slice(bytes);
-
+            debug_assert!(bytes <= width, "a field cannot be wider than its slot");
             flags |= flag;
             at += width;
-
-            Ok(())
-        };
-
-        if let Some(mac) = &self.mac {
-            put(Self::MAC, mac)?;
-        }
-        for (field, value) in [
-            (Self::IP, self.ip),
-            (Self::SUBNET, self.subnet),
-            (Self::GATEWAY, self.gateway),
-            (Self::DNS_IP, self.dns_ip),
-        ] {
-            if let Some(address) = value {
-                put(field, &reversed(address))?;
-            }
-        }
-        if let Some(name) = &self.dns_name {
-            put(Self::DNS_NAME, name.as_bytes())?;
         }
 
-        let used = buffer.get_mut(..at).ok_or(WireError::WriteBufferTooShort)?;
+        buffer[0] = flags;
 
-        // The flags byte is only known once every field has been seen.
-        *used.first_mut().ok_or(WireError::WriteBufferTooShort)? = flags;
-        used.get_mut(1..Self::FIELDS_START)
-            .ok_or(WireError::WriteBufferTooShort)?
-            .fill(0);
-
-        Ok(used)
+        buffer
     }
 
+    fn packed_len(&self) -> usize {
+        self.present()
+            .fold(Self::FIELDS_START, |total, ((_, width), _)| total + width)
+    }
+}
+
+impl EtherCrabWireRead for IpParam {
     /// Reads the payload of a Set-IP request or a Get-IP response.
     ///
     /// # Errors
     ///
-    /// [`WireError`] if the payload ends before a field its own flags promised.
-    pub fn unpack(payload: &[u8]) -> Result<Self, WireError> {
-        let flags = *payload.first().ok_or(WireError::ReadBufferTooShort)?;
-        let mut at = Self::FIELDS_START;
+    /// [`WireError::ReadBufferTooShort`] if the payload ends before a field its own flags
+    /// promised, or [`WireError::InvalidUtf8`] if the DNS name is not valid UTF-8.
+    fn unpack_from_slice(buf: &[u8]) -> Result<Self, WireError> {
+        let flags = *buf.first().ok_or(WireError::ReadBufferTooShort)?;
+        let mut at = IpParam::FIELDS_START;
 
         let mut take = |(flag, width): (u8, usize)| -> Result<Option<&[u8]>, WireError> {
             if flags & flag == 0 {
                 return Ok(None);
             }
 
-            let field = payload
+            let field = buf
                 .get(at..at + width)
                 .ok_or(WireError::ReadBufferTooShort)?;
             at += width;
@@ -427,36 +444,42 @@ impl IpParam {
             Ok(Some(field))
         };
 
-        let mac = take(Self::MAC)?
-            .map(|bytes| bytes.try_into().map_err(|_| WireError::ReadBufferTooShort))
+        let mac = take(IpParam::MAC)?
+            .map(|bytes| <[u8; 6]>::try_from(bytes).map_err(|_| WireError::ArrayLength))
             .transpose()?;
 
         let mut address = |field| -> Result<Option<Ipv4Addr>, WireError> {
-            Ok(take(field)?
-                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-                .map(|bytes| Ipv4Addr::new(bytes[3], bytes[2], bytes[1], bytes[0])))
+            take(field)?
+                .map(|bytes| {
+                    <[u8; 4]>::try_from(bytes)
+                        .map(|wire| Ipv4Addr::new(wire[3], wire[2], wire[1], wire[0]))
+                        .map_err(|_| WireError::ArrayLength)
+                })
+                .transpose()
         };
 
-        let ip = address(Self::IP)?;
-        let subnet = address(Self::SUBNET)?;
-        let gateway = address(Self::GATEWAY)?;
-        let dns_ip = address(Self::DNS_IP)?;
+        let ip = address(IpParam::IP)?;
+        let subnet = address(IpParam::SUBNET)?;
+        let gateway = address(IpParam::GATEWAY)?;
+        let dns_ip = address(IpParam::DNS_IP)?;
 
-        let dns_name = take(Self::DNS_NAME)?
+        let dns_name = take(IpParam::DNS_NAME)?
             .map(|bytes| {
-                // Zero padded on the wire; the trailing zeroes are not part of the name.
+                // Zero padded on the wire, and SOEM notes "Assume ZERO terminated string"
+                // (`ec_eoe.c:290`), so a name with an interior zero comes back truncated.
+                // That is faithful to the reference rather than a loss of information.
                 let end = bytes
                     .iter()
                     .position(|byte| *byte == 0)
                     .unwrap_or(bytes.len());
-                let text = core::str::from_utf8(bytes.get(..end).unwrap_or_default())
-                    .map_err(|_| WireError::ReadBufferTooShort)?;
+                let text = core::str::from_utf8(bytes.get(..end).ok_or(WireError::ArrayLength)?)
+                    .map_err(|_| WireError::InvalidUtf8)?;
 
-                heapless::String::try_from(text).map_err(|()| WireError::ReadBufferTooShort)
+                heapless::String::try_from(text).map_err(|()| WireError::ArrayLength)
             })
             .transpose()?;
 
-        Ok(Self {
+        Ok(IpParam {
             mac,
             ip,
             subnet,
@@ -465,13 +488,6 @@ impl IpParam {
             dns_name,
         })
     }
-}
-
-/// An IPv4 address in the byte order EoE puts it on the wire: last octet first.
-fn reversed(address: Ipv4Addr) -> [u8; 4] {
-    let [a, b, c, d] = address.octets();
-
-    [d, c, b, a]
 }
 
 #[cfg(test)]
@@ -855,7 +871,7 @@ mod ip_param_tests {
 
         let mut buffer = [0u8; 12];
         let written = param
-            .pack_to(&mut buffer)
+            .pack_to_slice(&mut buffer)
             .expect("room for flags plus two addresses");
 
         assert_eq!(
@@ -880,7 +896,7 @@ mod ip_param_tests {
         };
 
         let mut buffer = [0u8; 8];
-        let written = param.pack_to(&mut buffer).expect("room");
+        let written = param.pack_to_slice(&mut buffer).expect("room");
 
         assert_eq!(&written[4..8], &[4, 3, 2, 1]);
     }
@@ -893,7 +909,7 @@ mod ip_param_tests {
         };
 
         let mut buffer = [0u8; 40];
-        let written = param.pack_to(&mut buffer).expect("room");
+        let written = param.pack_to_slice(&mut buffer).expect("room");
 
         assert_eq!(written.len(), 4 + 32, "flags word plus the full name field");
         assert_eq!(&written[4..8], b"edge");
@@ -906,7 +922,7 @@ mod ip_param_tests {
     #[test]
     fn nothing_set_is_a_flags_word_and_no_fields() {
         let mut buffer = [0u8; 8];
-        let written = IpParam::default().pack_to(&mut buffer).expect("room");
+        let written = IpParam::default().pack_to_slice(&mut buffer).expect("room");
 
         assert_eq!(written, &[0x00, 0x00, 0x00, 0x00]);
     }
@@ -923,9 +939,9 @@ mod ip_param_tests {
         };
 
         let mut buffer = [0u8; 64];
-        let written = param.pack_to(&mut buffer).expect("room");
+        let written = param.pack_to_slice(&mut buffer).expect("room");
 
-        assert_eq!(IpParam::unpack(written), Ok(param));
+        assert_eq!(IpParam::unpack_from_slice(written), Ok(param));
     }
 
     #[test]
@@ -933,8 +949,11 @@ mod ip_param_tests {
         // A device that sets a flag and then truncates the frame must not take us down.
         let claims_an_ip = [0x02, 0x00, 0x00, 0x00, 10, 0];
 
-        assert!(IpParam::unpack(&claims_an_ip).is_err());
-        assert!(IpParam::unpack(&[]).is_err(), "not even the flags word");
+        assert!(IpParam::unpack_from_slice(&claims_an_ip).is_err());
+        assert!(
+            IpParam::unpack_from_slice(&[]).is_err(),
+            "not even the flags word"
+        );
     }
 
     #[test]
@@ -945,6 +964,85 @@ mod ip_param_tests {
         };
 
         let mut buffer = [0u8; 7];
-        assert!(param.pack_to(&mut buffer).is_err());
+        assert!(param.pack_to_slice(&mut buffer).is_err());
+    }
+
+    #[test]
+    fn all_six_fields_land_where_the_c_source_puts_them() {
+        // The round trip cannot see a field pair that was swapped on both sides, and the
+        // two-field fixture above pins only IP and subnet. This pins every flag bit and
+        // every offset against absolute bytes.
+        let param = IpParam {
+            mac: Some([1, 2, 3, 4, 5, 6]),
+            ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            subnet: Some(Ipv4Addr::new(255, 255, 0, 0)),
+            gateway: Some(Ipv4Addr::new(10, 0, 0, 254)),
+            dns_ip: Some(Ipv4Addr::new(9, 9, 9, 9)),
+            dns_name: Some(heapless::String::try_from("dns").expect("fits")),
+        };
+
+        let mut buffer = [0u8; 64];
+        let written = param.pack_to_slice(&mut buffer).expect("room");
+
+        assert_eq!(written[0], 0x3F, "all six include flags");
+        assert_eq!(&written[1..4], &[0, 0, 0], "reserved");
+        assert_eq!(&written[4..10], &[1, 2, 3, 4, 5, 6], "MAC");
+        assert_eq!(&written[10..14], &[1, 0, 0, 10], "IP, last octet first");
+        assert_eq!(&written[14..18], &[0, 0, 255, 255], "subnet");
+        assert_eq!(&written[18..22], &[254, 0, 0, 10], "gateway");
+        assert_eq!(&written[22..26], &[9, 9, 9, 9], "DNS server");
+        assert_eq!(&written[26..29], b"dns", "DNS name");
+        assert_eq!(written.len(), 4 + 6 + 4 + 4 + 4 + 4 + 32);
+    }
+
+    #[test]
+    fn the_padding_is_zeroed_and_not_inherited_from_the_caller() {
+        // Every other test hands in an already zeroed buffer, so neither the reserved
+        // bytes nor the DNS padding were pinned by anything: deleting both `fill(0)` calls
+        // left the suite green.
+        let param = IpParam {
+            dns_name: Some(heapless::String::try_from("hi").expect("fits")),
+            ..IpParam::default()
+        };
+
+        let mut buffer = [0xAAu8; 64];
+        let written = param.pack_to_slice(&mut buffer).expect("room");
+
+        assert_eq!(&written[1..4], &[0, 0, 0], "reserved bytes, not 0xAA");
+        assert_eq!(&written[4..6], b"hi");
+        assert!(
+            written[6..].iter().all(|byte| *byte == 0),
+            "the rest of the name field is zero: {:02x?}",
+            &written[6..]
+        );
+    }
+
+    #[test]
+    fn a_dns_name_that_is_not_utf8_says_so() {
+        // Reporting this as "buffer too short" sends whoever reads the log looking for a
+        // truncated frame that is not there.
+        let mut payload = [0u8; 36];
+        payload[0] = 0x20; // DNS_NAME_INCLUDE
+        payload[4] = 0xFF;
+        payload[5] = 0xFE;
+
+        assert_eq!(
+            IpParam::unpack_from_slice(&payload),
+            Err(WireError::InvalidUtf8)
+        );
+    }
+
+    #[test]
+    fn a_name_that_fills_the_field_survives() {
+        let long = "x".repeat(IpParam::DNS_NAME_LENGTH);
+        let param = IpParam {
+            dns_name: Some(heapless::String::try_from(long.as_str()).expect("exactly 32")),
+            ..IpParam::default()
+        };
+
+        let mut buffer = [0u8; 64];
+        let written = param.pack_to_slice(&mut buffer).expect("room");
+
+        assert_eq!(IpParam::unpack_from_slice(written), Ok(param));
     }
 }

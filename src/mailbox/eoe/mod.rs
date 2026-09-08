@@ -830,6 +830,20 @@ pub enum ReassemblyError {
         /// The port the fragment named.
         received: u8,
     },
+    /// The SubDevice sent more fragments than one frame can consist of, without ever
+    /// finishing it.
+    ///
+    /// The reference implementation cannot reach this: `ecx_EOErecv` keeps its state in
+    /// locals and breaks on the frame number check (`ec_eoe.c:496`) the moment a second
+    /// fragment zero arrives. [`Reassembly::push`] deliberately does not - a SubDevice
+    /// that gives up on a frame simply begins the next one, and refusing that would wedge
+    /// the link. That leniency is right for a reassembly the caller drives, and it is why
+    /// a loop over one needs a bound of its own.
+    TooManyFragments {
+        /// The largest number of fragments one frame can be cut into: the offset field is
+        /// six bits counting 32 byte blocks.
+        limit: usize,
+    },
 }
 
 impl core::fmt::Display for ReassemblyError {
@@ -874,6 +888,11 @@ impl core::fmt::Display for ReassemblyError {
                 "the last fragment promises an appended timestamp but the frame is only {} bytes",
                 total
             ),
+            Self::TooManyFragments { limit } => write!(
+                f,
+                "more than {} fragments arrived without the frame ever ending",
+                limit
+            ),
             Self::WrongPort { expected, received } => write!(
                 f,
                 "a fragment for port {} arrived while reassembling port {}",
@@ -917,7 +936,7 @@ pub enum Reassembled<'a> {
 
 /// Puts EoE fragments back together into an Ethernet frame.
 ///
-/// Ported from `ecx_EOErecv` (`ec_eoe.c:437-557`), with one deliberate difference. When a
+/// Ported from `ecx_EOErecv` (`ec_eoe.c:437-543`), with one deliberate difference. When a
 /// fragment does not fit the buffer, the reference implementation **drops it silently**
 /// (`:509`) and does not advance its fragment counter, so the *next* fragment fails the
 /// order check and the error names the wrong thing. Here an overrun is reported where it
@@ -2364,7 +2383,7 @@ mod reassembly_tests {
     fn a_fragment_that_overruns_what_was_announced_is_rejected() {
         // The size is announced once, in fragment zero. A device that then sends more
         // than it promised is lying about one of the two, and the reference
-        // implementation silently DROPS the fragment (`ec_eoe.c:509`) without advancing
+        // implementation silently DROPS the fragment (`ec_eoe.c:510`) without advancing
         // its counter - so the next fragment fails the order check instead, and the error
         // names the wrong thing.
         let frame = [0u8; 200];
@@ -3004,16 +3023,24 @@ pub(crate) fn push_mailbox<'buf>(
     reassembly: &'buf mut Reassembly<'_>,
     payload: &[u8],
 ) -> Result<Reassembled<'buf>, Error> {
-    let mailbox = MailboxHeader::unpack_from_slice(payload)?;
+    // The protocol nibble is read from the raw byte BEFORE the header is decoded, and
+    // that ordering is the whole point of the variant. `MailboxType` has no catch-all -
+    // 0x06..0x0e are simply absent - so decoding first turns an unknown protocol into
+    // `WireError::InvalidValue`, which names neither the nibble nor the mailbox. That is
+    // exactly the case worth reporting, and it was the one case this could not report.
+    //
+    // `(mbxtype & 0x0f) == ECT_MBXT_EOE` (`ec_eoe.c:461`); anything else is
+    // `EC_ERR_TYPE_PACKET_ERROR` (`:538`). The nibble sits in the low four bits of byte
+    // five, where `MailboxHeader` puts `mailbox_type`.
+    let received = payload.get(5).ok_or(WireError::ReadBufferTooShort)? & 0x0F;
 
-    // `(mbxtype & 0x0f) == ECT_MBXT_EOE` (`ec_eoe.c:461`), and anything else is
-    // `EC_ERR_TYPE_PACKET_ERROR` (`:538`). The nibble is already decoded by the wire
-    // derive, so an unknown one fails there rather than here.
-    if mailbox.mailbox_type != MailboxType::Eoe {
+    if received != MailboxType::Eoe as u8 {
         return Err(Error::Mailbox(MailboxError::UnexpectedProtocol {
-            received: mailbox.mailbox_type as u8,
+            received,
         }));
     }
+
+    let mailbox = MailboxHeader::unpack_from_slice(payload)?;
 
     let length = usize::from(mailbox.length);
 
@@ -3031,6 +3058,12 @@ pub(crate) fn push_mailbox<'buf>(
     Ok(reassembly.push(header, &announced[EoeHeader::PACKED_LEN..])?)
 }
 
+/// The most fragments one Ethernet frame can be cut into.
+///
+/// The offset field is six bits counting 32 byte blocks, so a frame stops at 63 blocks -
+/// and a fragment carries at least one block, or `Fragments` refuses the mailbox.
+const MAX_FRAGMENTS: usize = Fragments::MAX_FRAME / 32;
+
 /// Reads one Ethernet frame out of a SubDevice's EoE port, fragment by fragment.
 ///
 /// Ported from `ecx_EOErecv` (`ec_eoe.c:437-543`): read the OUT mailbox, feed the fragment
@@ -3047,17 +3080,23 @@ pub(crate) fn push_mailbox<'buf>(
 /// [`MailboxError::UnexpectedProtocol`] rather than handed to whoever was waiting for it.
 /// That is the reference implementation's own shape - `ecx_EOErecv` calls `ecx_mbxreceive`
 /// directly - and it is why SOEM grows a mailbox handler
-/// (`ecx_mbxhandler`, `ec_main.c:1507`) for anyone who needs both at once. Sorting the
+/// (`ecx_mbxhandler`, `ec_main.c:1506`) for anyone who needs both at once. Sorting the
 /// protocols apart belongs to that pump, not here.
 ///
 /// # Errors
 ///
 /// [`Error::Mailbox`] with [`MailboxError::NoWriteMailbox`] if the SubDevice has no read
-/// mailbox - the pairing is upstream's, see the note in [`wait_for_mailboxes`].
+/// mailbox - the pairing is upstream's, see the note in
+/// [`wait_for_mailboxes`](crate::mailbox::wait_for_mailboxes).
 ///
 /// Otherwise whatever [`push_mailbox`] reports, and [`Error::Timeout`] if a fragment does
 /// not arrive within
 /// [`Timeouts::mailbox_response`](crate::Timeouts::mailbox_response).
+///
+/// **On any error the half assembled frame is gone and `buffer` holds an unspecified
+/// number of valid bytes with no way to learn how many.** The reassembly is dropped with
+/// the call, so nothing says how far it had got. A caller that needs to know holds its own
+/// [`Reassembly`], asks [`Reassembly::in_progress`], and feeds it [`push_mailbox`].
 #[allow(dead_code)]
 pub(crate) async fn receive_frame<'buf, S>(
     subdevice: &SubDeviceRef<'_, S>,
@@ -3076,7 +3115,24 @@ where
     let mut reassembly = Reassembly::new(buffer, port)?;
     let length;
 
+    // A frame is at most `MAX_FRAGMENTS` fragments, because the offset field is six bits
+    // counting 32 byte blocks. Without this bound the loop does not terminate on a
+    // SubDevice that keeps sending fragment zero: `Reassembly::push` lets a fragment zero
+    // restart a partial on purpose and answers `More` every time, and each turn of the
+    // loop gets a fresh `mailbox_response` timeout, so nothing ever expires. The caller's
+    // only way out would be to drop the future.
+    let mut seen = 0usize;
+
     loop {
+        seen += 1;
+
+        if seen > MAX_FRAGMENTS {
+            return Err(ReassemblyError::TooManyFragments {
+                limit: MAX_FRAGMENTS,
+            }
+            .into());
+        }
+
         let response = crate::mailbox::wait_for_mailbox_response(subdevice, &read_mailbox).await?;
 
         // Only the length crosses the end of the borrow, not the slice. Returning the
@@ -3684,6 +3740,40 @@ mod mailbox_path_tests {
     }
 
     #[test]
+    fn an_unknown_protocol_nibble_is_reported_with_its_value() {
+        // The whole reason the nibble is read before the header is decoded. `MailboxType`
+        // has no catch-all, so decoding first turns 0x07 into `WireError::InvalidValue`,
+        // which names neither the nibble nor the mailbox.
+        //
+        // Two values, and neither is EoE's own 2 or CoE's 3: a single case cannot tell a
+        // threaded-through nibble from a hardcoded one, which is the mistake this module
+        // made with `port` one work package ago.
+        for nibble in [0x04u8, 0x07] {
+            let mut buffer = [0u8; 64];
+            let mut reassembly = Reassembly::new(&mut buffer, PORT).expect("A reassembly");
+
+            let mut mailbox = mailbox_holding(
+                EoeHeader {
+                    last_fragment: true,
+                    ..EoeHeader::new(FrameType::FragData, PORT).with_fragment(0, 1, 1)
+                },
+                1,
+                b"four",
+            );
+            mailbox[5] = (mailbox[5] & 0xF0) | nibble;
+
+            assert_eq!(
+                push_mailbox(&mut reassembly, &mailbox),
+                Err(Error::Mailbox(MailboxError::UnexpectedProtocol {
+                    received: nibble
+                })),
+                "mailbox type {:#03x}",
+                nibble
+            );
+        }
+    }
+
+    #[test]
     fn a_length_that_cannot_hold_an_eoe_header_is_refused() {
         // `eoedatasize = length - 4` (`ec_eoe.c:463`) underflows for a length under four,
         // and the reference then hands `memcpy` a size near `SIZE_MAX`.
@@ -3903,6 +3993,68 @@ mod mailbox_path_tests {
                 received: MailboxType::Coe as u8
             })),
             "it is reported, not skipped - sorting the protocols apart is a pump's job"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_frame_that_never_ends_is_given_up_on() {
+        const MAX_FRAMES: usize = 16;
+        const MAX_PDU_DATA: usize = PduStorage::element_size(128);
+
+        static PDU_STORAGE: PduStorage<MAX_FRAMES, MAX_PDU_DATA> = PduStorage::new();
+
+        crate::test_logger();
+
+        let (tx, rx, pdu_loop) = PDU_STORAGE.try_split().expect("can only split once");
+
+        // A SubDevice that keeps announcing a new frame. `Reassembly::push` lets a
+        // fragment zero restart a partial deliberately and answers `More` every time, and
+        // every turn of the loop gets a fresh mailbox timeout - so without a bound of its
+        // own the call never returns and the caller's only exit is dropping the future.
+        let restart = mailbox_holding(
+            EoeHeader::new(FrameType::FragData, PORT).with_fragment(0, 2, 1),
+            1,
+            &[0u8; 32],
+        );
+
+        let net = Loopback::start_serving(
+            tx,
+            rx,
+            |_| 1,
+            core::iter::repeat_n(restart, MAX_FRAGMENTS + 2).collect(),
+        );
+
+        let maindevice = MainDevice::new(pdu_loop, timeouts(), MainDeviceConfig::default());
+
+        let subdevice = subdevice_with_mailbox(MAILBOX_LEN);
+        let subdevice_ref = SubDeviceRef::new(&maindevice, CONFIGURED_ADDRESS, &subdevice);
+
+        let mut buffer = [0u8; 128];
+
+        let result = receive_frame(&subdevice_ref, PORT, &mut buffer)
+            .await
+            .map(<[u8]>::to_vec);
+
+        let (_written, read) = net.finish();
+
+        assert_eq!(
+            result,
+            Err(Error::Reassembly(ReassemblyError::TooManyFragments {
+                limit: MAX_FRAGMENTS
+            })),
+            "the loop has to end by itself, not by the caller giving up"
+        );
+
+        // WHERE it stops, not just that it stops. Asserting the error alone leaves the
+        // bound free: making it one too generous keeps this test green, because the error
+        // reports the constant rather than the bound it actually used. Counting the reads
+        // of the OUT mailbox pins the number.
+        assert_eq!(
+            read.iter()
+                .filter(|&&register| register == READ_MAILBOX_ADDRESS)
+                .count(),
+            MAX_FRAGMENTS,
+            "a frame is 63 fragments at most, so the 64th read must not happen"
         );
     }
 

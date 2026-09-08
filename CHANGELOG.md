@@ -64,8 +64,9 @@ A pure Rust EtherCAT MainDevice supporting std and no_std environments.
 - `MailboxError::UnexpectedProtocol` reports a mailbox holding a protocol other than the
   one being read. One mailbox carries every protocol a SubDevice supports, so a CoE
   response can arrive while an EoE fragment is expected. It carries the raw mailbox type
-  nibble rather than a decoded type, because a value this crate does not know is exactly
-  the case worth reporting.
+  nibble rather than a decoded type, and it is read from the raw byte *before* the header
+  is decoded - `MailboxType` has no catch-all, so decoding first turns an unknown protocol
+  into a wire error that names neither the nibble nor the mailbox.
 
 ### Fixed
 

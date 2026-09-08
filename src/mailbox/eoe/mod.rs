@@ -993,14 +993,16 @@ impl<'buf> Reassembly<'buf> {
     /// nothing can follow it. (It fires when the *whole* frame so far is under four bytes,
     /// not when that one fragment is.)
     ///
-    /// This is a deliberate difference from `ecx_EOEreadfragment`, which zeroes its state
-    /// on a fragment, frame or offset mismatch (`ec_eoe.c:585-602`, `:614-622`,
-    /// `:623-631`). Its caller *can* reset it - the state lives in four variables the
-    /// caller owns - but it is given nothing to reset *from*: the return value says
-    /// "assembling", "done" or "error" and nothing about what is half built. So zeroing on
-    /// any surprise is the only recovery it can offer from inside. Here the partial is a
-    /// visible thing, through [`in_progress`](Self::in_progress) and
-    /// [`abandon`](Self::abandon), and the caller owns the clock.
+    /// This is a deliberate difference from `ecx_EOEreadfragment`. There the partial lives
+    /// in four variables the caller owns and passes in, and on a frame or offset mismatch
+    /// the function **zeroes them before returning the error** (`ec_eoe.c:614-622`,
+    /// `:623-631`; the fragment mismatch at `:585-602` zeroes them too, but only when the
+    /// expected fragment is not already zero). By the time the caller looks, the half
+    /// assembled frame is gone - it never gets to decide.
+    ///
+    /// Here it decides: an error leaves the partial alone, [`in_progress`](Self::in_progress)
+    /// says what is there, [`abandon`](Self::abandon) throws it away, and the clock that
+    /// says when is the caller's.
     ///
     /// # Errors
     ///

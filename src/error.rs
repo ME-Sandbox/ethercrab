@@ -1,7 +1,7 @@
 //! EtherCrab error types.
 
 pub use crate::mailbox::coe::CoeAbortCode;
-pub use crate::mailbox::eoe::FragmentError;
+pub use crate::mailbox::eoe::{FragmentError, ReassemblyError};
 use crate::{AlStatusCode, SubDeviceState, command::Command, fmt};
 use core::num::TryFromIntError;
 
@@ -25,6 +25,8 @@ pub enum Error {
     Eeprom(EepromError),
     /// An Ethernet frame could not be split into EoE fragments.
     Fragment(FragmentError),
+    /// EoE fragments could not be put back together into an Ethernet frame.
+    Reassembly(ReassemblyError),
     /// A fixed size array was not large enough to hold a given item type.
     Capacity(Item),
     /// A string was too long to fit in a fixed size buffer.
@@ -113,6 +115,7 @@ impl core::fmt::Display for Error {
             Error::Timeout(kind) => write!(f, "timeout: {}", kind),
             Error::Eeprom(e) => write!(f, "eeprom: {}", e),
             Error::Fragment(e) => write!(f, "eoe fragment: {}", e),
+            Error::Reassembly(e) => write!(f, "eoe reassembly: {}", e),
             Error::Capacity(item) => write!(f, "not enough capacity for {:?}", item),
             Error::StringTooLong {
                 max_length,
@@ -492,6 +495,12 @@ impl From<EepromError> for Error {
 impl From<FragmentError> for Error {
     fn from(e: FragmentError) -> Self {
         Self::Fragment(e)
+    }
+}
+
+impl From<ReassemblyError> for Error {
+    fn from(e: ReassemblyError) -> Self {
+        Self::Reassembly(e)
     }
 }
 

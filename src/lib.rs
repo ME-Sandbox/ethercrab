@@ -195,7 +195,7 @@ use ethernet::EthernetAddress;
 pub use mailbox::coe::SubIndex;
 pub use mailbox::eoe::{
     EoeHeader, EoeResult, Fragment, Fragments, FrameType, IpParam, Reassembled, Reassembly,
-    ReassemblyError, SecondWord,
+    SecondWord,
 };
 pub use maindevice::MainDevice;
 pub use maindevice_config::{MainDeviceConfig, RetryBehaviour};

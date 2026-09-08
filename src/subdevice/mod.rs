@@ -263,6 +263,38 @@ impl SubDevice {
         self.oversampling_config = oversampling_config
     }
 
+    /// Whether this SubDevice announced Ethernet over EtherCAT in its EEPROM.
+    ///
+    /// Read from the mailbox protocols in the SII general category during
+    /// [`init`](crate::MainDevice::init), so asking costs nothing and needs no bus
+    /// traffic. A device that says no will not answer
+    /// [`eoe_send`](crate::SubDeviceRef::eoe_send) - though one that says yes is not
+    /// thereby obliged to be good at it.
+    ///
+    /// This is the question the first line of an EoE program asks, and the crate knew the
+    /// answer without letting anyone see it: `supported_protocols` sits behind a
+    /// crate-internal `config`. Same shape as [`ports`](Self::ports) above, and for the
+    /// same reason.
+    ///
+    /// A `bool` rather than the flags themselves: that is the whole question this API
+    /// raises, and returning `MailboxProtocols` would commit the crate to a bitflags
+    /// surface nobody has asked for.
+    ///
+    /// ```rust,no_run
+    /// # use ethercrab::SubDevice;
+    /// # fn example(subdevice: &SubDevice) {
+    /// if !subdevice.supports_eoe() {
+    ///     // No point sending it an ethernet frame.
+    /// }
+    /// # }
+    /// ```
+    pub fn supports_eoe(&self) -> bool {
+        self.config
+            .mailbox
+            .supported_protocols
+            .contains(crate::eeprom::types::MailboxProtocols::EOE)
+    }
+
     /// The state of this SubDevice's four ports, and with it the shape it forms in the
     /// network.
     ///
@@ -611,19 +643,31 @@ where
     /// waiting for the SubDevice to take each before the next goes out. `port` is the EoE
     /// port of a multi-port SubDevice; a device with one port uses zero.
     ///
-    /// A flat method rather than a handle, because that is how this crate offers CoE:
-    /// [`sdo_read`](Self::sdo_read) and its siblings delegate to a `Coe` a caller cannot
-    /// name, since `mod mailbox` is private. One shape for both protocols.
+    /// A flat method rather than a handle, because that is the shape this crate offers CoE
+    /// in: [`sdo_read`](Self::sdo_read) and its siblings are one line each, delegating to a
+    /// `Coe` no caller can name, since `mod mailbox` is private. The same *public* shape,
+    /// not the same internals - these two delegate to free functions rather than to a
+    /// handle of their own.
     ///
     /// # Errors
     ///
-    /// [`Error::Mailbox`] if the SubDevice has no write mailbox or it cannot hold the six
-    /// byte mailbox header and the four byte EoE header, [`Error::Fragment`] if the frame
-    /// cannot be cut for this mailbox - it is longer than the six bit offset field can
-    /// name, or the port does not fit its four bits - and [`Error::WorkingCounter`] if the
-    /// SubDevice does not acknowledge a fragment. **A failed write stops the frame**, so
-    /// the SubDevice may be left holding a partial one; it never gets the last fragment
-    /// and discards it.
+    /// [`Error::Mailbox`] with [`MailboxError::NoReadMailbox`](crate::error::MailboxError::NoReadMailbox)
+    /// if the SubDevice has no write mailbox. The pairing looks swapped and is upstream's;
+    /// it is the one `wait_for_mailboxes` uses for the same field.
+    ///
+    /// [`Error::Fragment`] for everything about the frame and the mailbox: a mailbox that
+    /// cannot hold the six byte mailbox header and the four byte EoE header, a mailbox
+    /// that cannot carry a whole 32 byte block of a frame that has to be split, a frame
+    /// longer than [`Fragments::MAX_FRAME`](crate::Fragments::MAX_FRAME) - 2016 bytes,
+    /// which is what a six bit offset field counting 32 byte blocks can name - and a port
+    /// above 15, which is what its four bit field can name.
+    ///
+    /// [`Error::WorkingCounter`] if the SubDevice does not acknowledge a fragment.
+    ///
+    /// **A failed write stops the frame**, so the SubDevice is left holding a partial one.
+    /// It keeps that partial until the fragment zero of the next frame displaces it -
+    /// neither this crate's [`Reassembly`](crate::Reassembly) nor `ecx_EOEreadfragment`
+    /// throws a half frame away on its own.
     pub async fn eoe_send(&self, port: u8, frame: &[u8]) -> Result<(), Error> {
         crate::mailbox::eoe::send_frame(self, port, frame).await
     }
@@ -640,12 +684,31 @@ where
     /// implementation's shape as well - `ecx_EOErecv` reads the mailbox directly - and it
     /// is why SOEM grows a mailbox handler for anyone who needs both protocols at once.
     ///
+    /// `buffer` has to be large enough for the frames this SubDevice sends: the frame is
+    /// assembled in it, and one that does not fit is refused before a byte is written.
+    /// 1514 bytes takes any Ethernet frame; EoE itself stops at
+    /// [`Fragments::MAX_FRAME`](crate::Fragments::MAX_FRAME).
+    ///
     /// # Errors
     ///
-    /// [`Error::Mailbox`] if the SubDevice has no read mailbox, or if the mailbox holds a
-    /// protocol other than EoE; [`Error::Reassembly`] for a fragment that does not fit the
-    /// frame being assembled, and for a SubDevice that keeps starting new frames without
-    /// ever finishing one; [`Error::Timeout`] if a fragment does not arrive in time.
+    /// [`Error::Mailbox`] with
+    /// [`NoWriteMailbox`](crate::error::MailboxError::NoWriteMailbox) if the SubDevice has
+    /// no read mailbox - upstream's pairing again - or with
+    /// [`UnexpectedProtocol`](crate::error::MailboxError::UnexpectedProtocol) if the
+    /// mailbox holds one of the other protocols this crate knows.
+    ///
+    /// [`Error::Wire`] for a mailbox this crate cannot read at all: an announced length
+    /// that does not fit what arrived, or a mailbox type in the reserved range 0x06..0x0e,
+    /// which has no name here and therefore fails while the header is decoded.
+    ///
+    /// [`Error::Fragment`] if `port` is above 15, which is what its four bit field can
+    /// name.
+    ///
+    /// [`Error::Reassembly`] for a frame too long for `buffer`, a fragment that does not
+    /// belong to the frame being assembled, and a SubDevice that keeps starting new frames
+    /// without ever finishing one.
+    ///
+    /// [`Error::Timeout`] if a fragment does not arrive in time.
     ///
     /// **On any error the partial frame is gone** and `buffer` holds an unspecified number
     /// of valid bytes with no way to learn how many.
@@ -973,6 +1036,25 @@ impl<'maindevice, S> SubDeviceRef<'maindevice, S> {
 mod tests {
     use super::*;
     use crate::subdevice::ports::{Ports, Topology};
+
+    #[test]
+    fn a_subdevice_says_whether_it_announced_eoe() {
+        // The third case is what makes this a test rather than a tautology: a device that
+        // announces a DIFFERENT protocol. With only "nothing" and "EoE", `contains` cannot
+        // be told apart from "any flag at all", and swapping the flag for CoE would pass.
+        use crate::eeprom::types::MailboxProtocols;
+
+        let with = |protocols| {
+            let mut subdevice = SubDevice::default();
+            subdevice.config.mailbox.supported_protocols = protocols;
+            subdevice
+        };
+
+        assert!(with(MailboxProtocols::EOE).supports_eoe());
+        assert!(with(MailboxProtocols::EOE | MailboxProtocols::COE).supports_eoe());
+        assert!(!with(MailboxProtocols::COE).supports_eoe());
+        assert!(!with(MailboxProtocols::empty()).supports_eoe());
+    }
 
     #[test]
     fn the_ports_a_subdevice_walked_are_readable() {

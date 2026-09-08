@@ -66,6 +66,11 @@ A pure Rust EtherCAT MainDevice supporting std and no_std environments.
   rather than a handle, because that is how this crate already offers CoE - `sdo_read` and
   its siblings delegate to a `Coe` a caller cannot name, since `mod mailbox` is private.
 
+  `SubDevice::supports_eoe` answers the question the first line of an EoE program asks.
+  EtherCrab reads the mailbox protocols out of the SII general category during `init()`
+  and had no way to let anyone see the answer - `supported_protocols` sits behind a
+  crate-internal `config`. Same shape as `SubDevice::ports()`, and for the same reason.
+
   `eoe_receive` owns the mailbox while it runs. One mailbox carries every protocol a
   SubDevice supports, so a CoE response arriving between two fragments is reported rather
   than handed to whoever was waiting for it - the reference implementation's own shape.

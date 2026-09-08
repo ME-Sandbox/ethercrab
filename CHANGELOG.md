@@ -32,6 +32,11 @@ A pure Rust EtherCAT MainDevice supporting std and no_std environments.
   details of that payload are easy to get wrong: IPv4 addresses go on the wire with the
   last octet first, and the DNS name field is always 32 bytes, zero padded.
 
+  `Fragments` splits an Ethernet frame into EoE fragments for a mailbox of a given size.
+  It is a pure iterator over borrowed data, and it rejects two cases the reference
+  implementation does not: a mailbox too small to carry one 32 byte block (which loops for
+  ever there) and a frame longer than the six bit offset field can name.
+
 ## [0.7.1] - 2026-03-23
 
 ### Fixed

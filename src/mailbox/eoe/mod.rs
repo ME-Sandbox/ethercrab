@@ -497,6 +497,146 @@ impl EtherCrabWireRead for IpParam {
     }
 }
 
+/// Why an Ethernet frame cannot be fragmented for a given mailbox.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum FragmentError {
+    /// The mailbox cannot carry a whole 32 byte block of EoE payload.
+    ///
+    /// The reference implementation has an infinite loop here: `((maxdata >> 5) << 5)` is
+    /// zero below 32, so a payload larger than the mailbox produces empty fragments for
+    /// ever. Only `maxdata < 0` is guarded (`ec_eoe.c:351`).
+    MailboxTooSmall {
+        /// EoE payload capacity of the mailbox, in bytes.
+        capacity: usize,
+    },
+    /// The frame is longer than a six bit offset can name.
+    ///
+    /// The offset field counts 32 byte blocks, so it stops at `63 * 32`. Fragment zero
+    /// has to fit the *whole frame size* into that same field. Ethernet tops out well
+    /// below it; a caller handing over more would otherwise get a frame whose offsets
+    /// wrap silently.
+    FrameTooLong {
+        /// Length of the frame that was offered, in bytes.
+        length: usize,
+        /// The largest length that can be expressed.
+        limit: usize,
+    },
+}
+
+/// Splits an Ethernet frame into EoE fragments.
+///
+/// Ported from `ecx_EOEsend` (`ec_eoe.c:333-430`). Every fragment but the last carries the
+/// mailbox capacity rounded **down** to a multiple of 32 bytes; the last carries what is
+/// left and sets [`EoeHeader::last_fragment`].
+///
+/// Pure: it borrows the frame and yields headers and slices of it, and does no I/O.
+#[derive(Debug)]
+pub struct Fragments<'a> {
+    frame: &'a [u8],
+    /// Bytes of EoE payload one mailbox can carry: `mbx_l - 0x0A` (`ec_eoe.c:344`).
+    block: usize,
+    frame_number: u8,
+    port: u8,
+    offset: usize,
+    number: u8,
+    done: bool,
+}
+
+impl<'a> Fragments<'a> {
+    /// Blocks are 32 bytes, both for the fragment size and for the offset field.
+    const BLOCK: usize = 32;
+
+    /// The offset field is six bits, counting blocks.
+    const MAX_BLOCKS: usize = 0x3F;
+
+    /// The longest frame whose size and offsets both fit the six bit field.
+    pub const MAX_FRAME: usize = Self::MAX_BLOCKS * Self::BLOCK;
+
+    /// Prepares to split `frame` for a mailbox that can carry `capacity` bytes of EoE
+    /// payload.
+    ///
+    /// # Errors
+    ///
+    /// [`FragmentError`] if the mailbox cannot carry a whole block, or the frame is longer
+    /// than the offset field can name.
+    pub fn new(
+        frame: &'a [u8],
+        capacity: usize,
+        frame_number: u8,
+        port: u8,
+    ) -> Result<Self, FragmentError> {
+        // Rounded down, as `((maxdata >> 5) << 5)` does - a fragment that is not a whole
+        // number of blocks would give the next one an offset the field cannot express.
+        let block = (capacity / Self::BLOCK) * Self::BLOCK;
+
+        if block == 0 {
+            return Err(FragmentError::MailboxTooSmall { capacity });
+        }
+
+        if frame.len() > Self::MAX_FRAME {
+            return Err(FragmentError::FrameTooLong {
+                length: frame.len(),
+                limit: Self::MAX_FRAME,
+            });
+        }
+
+        Ok(Self {
+            frame,
+            block,
+            frame_number,
+            port,
+            offset: 0,
+            number: 0,
+            done: false,
+        })
+    }
+
+    /// The number of 32 byte blocks `bytes` occupies, rounded up.
+    ///
+    /// `(psize + 31) >> 5` in the reference implementation.
+    fn blocks(bytes: usize) -> u8 {
+        u8::try_from(bytes.div_ceil(Self::BLOCK)).unwrap_or(u8::MAX)
+    }
+}
+
+impl<'a> Iterator for Fragments<'a> {
+    type Item = (EoeHeader, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+
+        let rest = self.frame.get(self.offset..)?;
+        let size = rest.len().min(self.block);
+        let last = size == rest.len();
+
+        let data = rest.get(..size)?;
+
+        // Fragment zero names the whole frame; every other one names where it starts.
+        // The overloading is `ec_eoe.c:387-391` - see `Fragment`.
+        let raw_offset = if self.number == 0 {
+            Self::blocks(self.frame.len())
+        } else {
+            Self::blocks(self.offset)
+        };
+
+        let mut header = EoeHeader::new(FrameType::FragData, self.port).with_fragment(
+            self.number,
+            raw_offset,
+            self.frame_number,
+        );
+        header.last_fragment = last;
+
+        self.offset += size;
+        self.number += 1;
+        self.done = last;
+
+        Some((header, data))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1070,6 +1210,152 @@ mod ip_param_tests {
         assert_eq!(
             IpParam::unpack_from_slice(&claims_a_name),
             Err(WireError::ReadBufferTooShort)
+        );
+    }
+}
+
+#[cfg(test)]
+mod fragment_tests {
+    use super::*;
+
+    /// The EoE payload capacity of a mailbox, from `ec_eoe.c:344`:
+    /// `maxdata = mbx_l - 0x0A` - six bytes of mailbox header plus four of EoE header.
+    const MAILBOX: usize = 128;
+    const MAX_DATA: usize = MAILBOX - 0x0A;
+
+    #[test]
+    fn a_frame_that_fits_is_one_last_fragment() {
+        let payload = [0xABu8; 40];
+        let fragments: Vec<_> = Fragments::new(&payload, MAX_DATA, 3, 0)
+            .expect("40 bytes fit")
+            .collect();
+
+        assert_eq!(fragments.len(), 1);
+
+        let (header, data) = &fragments[0];
+        assert!(header.last_fragment);
+        assert_eq!(header.frame_type, FrameType::FragData);
+        assert_eq!(data, &&payload[..]);
+
+        let fragment = header.fragment().expect("a data frame");
+        assert_eq!(fragment.number, 0);
+        assert_eq!(fragment.frame_number, 3);
+        assert_eq!(
+            fragment.total_frame_size(),
+            Some(64),
+            "40 rounded up to a multiple of 32, as `(psize + 31) >> 5` does"
+        );
+    }
+
+    #[test]
+    fn a_longer_frame_is_cut_on_thirty_two_byte_boundaries() {
+        // `ec_eoe.c:371`: txframesize = ((maxdata >> 5) << 5). 118 bytes of capacity
+        // become 96, not 118 - a fragment that is not a multiple of 32 would make the
+        // next one's offset unrepresentable.
+        let payload = [0u8; 250];
+        let fragments: Vec<_> = Fragments::new(&payload, MAX_DATA, 0, 0)
+            .expect("fits")
+            .collect();
+
+        let sizes: Vec<_> = fragments.iter().map(|(_, data)| data.len()).collect();
+        assert_eq!(sizes, vec![96, 96, 58], "96 = (118 >> 5) << 5");
+
+        assert!(!fragments[0].0.last_fragment);
+        assert!(!fragments[1].0.last_fragment);
+        assert!(fragments[2].0.last_fragment);
+    }
+
+    #[test]
+    fn only_the_first_fragment_carries_the_size_the_rest_carry_offsets() {
+        let payload = [0u8; 250];
+        let fragments: Vec<_> = Fragments::new(&payload, MAX_DATA, 7, 0)
+            .expect("fits")
+            .collect();
+
+        let first = fragments[0].0.fragment().expect("data frame");
+        assert_eq!(first.number, 0);
+        assert_eq!(first.total_frame_size(), Some(256), "250 rounded up");
+        assert_eq!(first.offset(), None);
+
+        let second = fragments[1].0.fragment().expect("data frame");
+        assert_eq!(second.number, 1);
+        assert_eq!(second.offset(), Some(96));
+        assert_eq!(second.total_frame_size(), None);
+
+        let third = fragments[2].0.fragment().expect("data frame");
+        assert_eq!(third.number, 2);
+        assert_eq!(third.offset(), Some(192));
+
+        for (header, _) in &fragments {
+            assert_eq!(
+                header.fragment().expect("data frame").frame_number,
+                7,
+                "the frame number is the same for every fragment of one frame"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fragments_put_back_together_are_the_original() {
+        let payload: Vec<u8> = (0..=255u8).cycle().take(1514).collect();
+        let rejoined: Vec<u8> = Fragments::new(&payload, MAX_DATA, 0, 0)
+            .expect("an ethernet frame fits")
+            .flat_map(|(_, data)| data.iter().copied())
+            .collect();
+
+        assert_eq!(rejoined, payload);
+    }
+
+    #[test]
+    fn an_empty_frame_is_still_one_fragment() {
+        let fragments: Vec<_> = Fragments::new(&[], MAX_DATA, 0, 0)
+            .expect("nothing fits too")
+            .collect();
+
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].0.last_fragment);
+        assert!(fragments[0].1.is_empty());
+    }
+
+    #[test]
+    fn a_mailbox_too_small_to_carry_a_block_is_rejected() {
+        // The trap in the C loop: with maxdata < 32, ((maxdata >> 5) << 5) is zero, so a
+        // payload larger than the mailbox produces zero length fragments for ever.
+        // `ec_eoe.c:351` only guards `maxdata < 0`.
+        assert!(Fragments::new(&[0u8; 100], 31, 0, 0).is_err());
+        assert!(
+            Fragments::new(&[0u8; 100], 32, 0, 0).is_ok(),
+            "32 is enough"
+        );
+    }
+
+    #[test]
+    fn a_frame_too_long_for_a_six_bit_offset_is_rejected() {
+        // The offset field is six bits in units of 32 bytes, so it cannot name anything
+        // beyond 63 * 32 = 2016 - and fragment zero has to fit the *total size* in it.
+        // Ethernet tops out at 1514, but a caller handing over more must be told, not
+        // silently given a frame whose offsets wrap.
+        assert!(Fragments::new(&[0u8; 2016], MAX_DATA, 0, 0).is_ok());
+        assert!(Fragments::new(&[0u8; 2017], MAX_DATA, 0, 0).is_err());
+    }
+
+    #[test]
+    fn the_fragment_number_is_six_bits_and_is_not_allowed_to_wrap() {
+        // 63 fragments of 32 bytes is 2016 bytes, which the size limit above already
+        // covers - but a small mailbox reaches the fragment limit first.
+        let payload = [0u8; 2016];
+        let fragments: Vec<_> = Fragments::new(&payload, 32, 0, 0).expect("fits").collect();
+
+        assert_eq!(fragments.len(), 63);
+        assert_eq!(
+            fragments
+                .last()
+                .expect("some")
+                .0
+                .fragment()
+                .expect("data")
+                .number,
+            62
         );
     }
 }

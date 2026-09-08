@@ -1139,56 +1139,66 @@ impl<'buf> Reassembly<'buf> {
     }
 }
 
-/// Builds the mailbox payload for one EoE fragment.
-///
-/// Ported from `ecx_EOEsend` (`ec_eoe.c:396-404`): a mailbox header whose length counts the
-/// EoE header plus the fragment data, then the two EoE header words, then the data.
-///
-/// ```text
-/// [ mailbox header 6 ][ EoE header 4 ][ fragment data ... ]
-///                ^--- length = 4 + data.len()
-/// ```
-///
-/// Pure, so the byte layout is testable without a bus. `buffer` is the mailbox sized
-/// scratch the caller writes from.
-///
-/// # Errors
-///
-/// [`WireError::WriteBufferTooShort`] if `buffer` cannot hold the two headers and the data.
-pub fn write_fragment<'buf>(
-    buffer: &'buf mut [u8],
-    counter: u8,
-    header: EoeHeader,
-    data: &[u8],
-) -> Result<&'buf [u8], WireError> {
-    let length = EoeHeader::PACKED_LEN + data.len();
-    let total = MailboxHeader::PACKED_LEN + length;
+impl EoeHeader {
+    /// Writes this header and `data` into `buffer` as one EoE mailbox payload.
+    ///
+    /// Ported from `ecx_EOEsend` (`ec_eoe.c:400-406`): a mailbox header whose length counts
+    /// the EoE header plus the fragment data, then the two EoE header words, then the data.
+    ///
+    /// ```text
+    /// [ mailbox header 6 ][ EoE header 4 ][ fragment data ... ]
+    ///                ^--- length = 4 + data.len()
+    /// ```
+    ///
+    /// `counter` is the mailbox counter, 1 to 7. It is a three bit field and is **masked**
+    /// like every other value this crate puts in that field, so 8 becomes 0 - which the
+    /// field's own documentation calls reserved. Pass what
+    /// [`SubDevice::mailbox_counter`](crate::SubDevice) gives you.
+    ///
+    /// Pure, so the byte layout is testable without a bus. Only the bytes it wrote are
+    /// returned; the rest of `buffer` is left as the caller had it.
+    ///
+    /// # Errors
+    ///
+    /// [`WireError::WriteBufferTooShort`] if `buffer` cannot hold the two headers and the
+    /// data, or [`WireError::ArrayLength`] if the payload does not fit the 16 bit length
+    /// field - unreachable through [`Fragments`], which caps a frame at 2016 bytes.
+    pub fn write_fragment<'buf>(
+        self,
+        buffer: &'buf mut [u8],
+        counter: u8,
+        data: &[u8],
+    ) -> Result<&'buf [u8], WireError> {
+        let length = Self::PACKED_LEN + data.len();
+        let total = MailboxHeader::PACKED_LEN + length;
 
-    let used = buffer
-        .get_mut(..total)
-        .ok_or(WireError::WriteBufferTooShort)?;
+        let used = buffer
+            .get_mut(..total)
+            .ok_or(WireError::WriteBufferTooShort)?;
 
-    let mailbox = MailboxHeader {
-        // `ecx_EOEsend` writes `4 + txframesize` - the EoE header plus the data, not the
-        // mailbox header. Counting the mailbox header too would make the SubDevice read
-        // six bytes past the frame.
-        length: u16::try_from(length).map_err(|_| WireError::WriteBufferTooShort)?,
-        priority: Priority::Lowest,
-        mailbox_type: MailboxType::Eoe,
-        counter,
-    };
+        let mailbox = MailboxHeader {
+            // `ecx_EOEsend` writes `4 + txframesize` - the EoE header plus the data, not
+            // the mailbox header. Counting the mailbox header too would make the SubDevice
+            // read six bytes past the frame. EtherCrab's own CoE requests count the same
+            // way (`SdoNormal::upload` writes 10 for a 16 byte request).
+            length: u16::try_from(length).map_err(|_| WireError::ArrayLength)?,
+            priority: Priority::Lowest,
+            mailbox_type: MailboxType::Eoe,
+            counter,
+        };
 
-    let after_mailbox = mailbox.pack_to_slice(used)?.len();
-    let rest = used
-        .get_mut(after_mailbox..)
-        .ok_or(WireError::WriteBufferTooShort)?;
+        let after_mailbox = mailbox.pack_to_slice(used)?.len();
+        let rest = used
+            .get_mut(after_mailbox..)
+            .ok_or(WireError::WriteBufferTooShort)?;
 
-    let after_header = header.pack_to_slice(rest)?.len();
-    rest.get_mut(after_header..)
-        .ok_or(WireError::WriteBufferTooShort)?
-        .copy_from_slice(data);
+        let after_header = self.pack_to_slice(rest)?.len();
+        rest.get_mut(after_header..)
+            .ok_or(WireError::WriteBufferTooShort)?
+            .copy_from_slice(data);
 
-    Ok(used)
+        Ok(used)
+    }
 }
 
 #[cfg(test)]
@@ -2664,14 +2674,19 @@ mod mailbox_tests {
         let header = EoeHeader::new(FrameType::FragData, 0).with_fragment(0, 1, 0);
 
         let mut buffer = [0xAAu8; 64];
-        let written = write_fragment(&mut buffer, 3, header, b"eight by").expect("room");
+        let written = header
+            .write_fragment(&mut buffer, 3, b"eight by")
+            .expect("room");
 
         assert_eq!(written.len(), 6 + 4 + 8);
-        assert_eq!(
-            &written[0..2],
-            &[0x0C, 0x00],
-            "length counts EoE header plus data"
-        );
+        // All six bytes of the mailbox header, not just the length: bytes 2..6 are where
+        // this crate's `MailboxHeader` could diverge from `ec_EOEt`, because it skips the
+        // address field in its wire derive rather than declaring it.
+        //   0c 00  length 0x000C = 4 + 8
+        //   00 00  address, always zero from a MainDevice
+        //   00     six reserved bits and priority 0 (`ec_eoe.c:365`)
+        //   32     type nibble 2 = ECT_MBXT_EOE, counter 3 shifted up four
+        assert_eq!(&written[0..6], &[0x0C, 0x00, 0x00, 0x00, 0x00, 0x32]);
         // frameinfo2 = FRAME_OFFSET_SET(1) = (1 & 0x3F) << 6 = 0x0040, little-endian.
         assert_eq!(
             &written[6..10],
@@ -2688,7 +2703,7 @@ mod mailbox_tests {
 
         for data in [&b""[..], &b"x"[..], &[0u8; 32][..]] {
             let mut buffer = [0u8; 64];
-            let written = write_fragment(&mut buffer, 1, header, data).expect("room");
+            let written = header.write_fragment(&mut buffer, 1, data).expect("room");
 
             let length = u16::from_le_bytes([written[0], written[1]]);
             assert_eq!(
@@ -2705,7 +2720,7 @@ mod mailbox_tests {
     fn the_mailbox_header_says_eoe_and_carries_the_counter() {
         let header = EoeHeader::new(FrameType::FragData, 0);
         let mut buffer = [0u8; 32];
-        let written = write_fragment(&mut buffer, 5, header, b"").expect("room");
+        let written = header.write_fragment(&mut buffer, 5, b"").expect("room");
 
         let mailbox = MailboxHeader::unpack_from_slice(&written[..6]).expect("a header");
 
@@ -2719,7 +2734,9 @@ mod mailbox_tests {
     fn the_eoe_header_survives_the_round_trip() {
         let header = EoeHeader::new(FrameType::FragData, 2).with_fragment(3, 4, 5);
         let mut buffer = [0u8; 32];
-        let written = write_fragment(&mut buffer, 1, header, b"data").expect("room");
+        let written = header
+            .write_fragment(&mut buffer, 1, b"data")
+            .expect("room");
 
         assert_eq!(
             EoeHeader::unpack_from_slice(&written[6..10]),
@@ -2735,14 +2752,14 @@ mod mailbox_tests {
 
         // Ten bytes hold both headers and nothing else.
         let mut exact = [0u8; 10];
-        assert!(write_fragment(&mut exact, 1, header, b"").is_ok());
+        assert!(header.write_fragment(&mut exact, 1, b"").is_ok());
         assert_eq!(
-            write_fragment(&mut exact, 1, header, b"x"),
+            header.write_fragment(&mut exact, 1, b"x"),
             Err(WireError::WriteBufferTooShort)
         );
 
         let mut nothing = [0u8; 0];
-        assert!(write_fragment(&mut nothing, 1, header, b"").is_err());
+        assert!(header.write_fragment(&mut nothing, 1, b"").is_err());
     }
 
     #[test]
@@ -2756,7 +2773,7 @@ mod mailbox_tests {
 
         for (header, data) in Fragments::new(&frame, MAILBOX - 6 - 4, 0, 0).expect("fits") {
             let mut buffer = [0u8; MAILBOX];
-            let written = write_fragment(&mut buffer, 1, header, data).expect("room");
+            let written = header.write_fragment(&mut buffer, 1, data).expect("room");
 
             assert!(written.len() <= MAILBOX, "a fragment must fit its mailbox");
             rejoined.extend_from_slice(&written[10..]);

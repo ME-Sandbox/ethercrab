@@ -405,9 +405,13 @@ impl EtherCrabWireWrite for IpParam {
             };
 
             // No check that `bytes <= width`: both sources are bounded by their type -
-            // a `[u8; 6]` MAC and a `heapless::String<32>` name - and a check placed
-            // after `copy_from_slice` would arrive after the slice index had already
-            // panicked anyway.
+            // a `[u8; 6]` MAC and a `heapless::String<32>` name against a 32 wide slot.
+            //
+            // A third source that is not bounded would be a real problem, and not a loud
+            // one. Only for the *last* present field does an overlong write run off the
+            // buffer and panic; for any field before it, `at` still advances by `width`,
+            // so the next field simply overwrites the overflow and the frame goes out
+            // silently wrong. Whoever adds a field checks its width here.
             flags |= flag;
             at += width;
         }
@@ -938,8 +942,8 @@ mod ip_param_tests {
             subnet: Some(Ipv4Addr::new(255, 0, 0, 0)),
             gateway: Some(Ipv4Addr::new(10, 0, 0, 1)),
             // Deliberately not 8.8.8.8: a palindromic address reads the same in both
-            // byte orders, so it pins the offset and nothing else. Every address in
-            // these tests has four distinct octets for that reason.
+            // byte orders, so it pins the offset and nothing else. No address in these
+            // tests is a palindrome, for that reason.
             dns_ip: Some(Ipv4Addr::new(8, 7, 6, 5)),
             dns_name: Some(heapless::String::try_from("murr").expect("fits")),
         };

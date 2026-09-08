@@ -500,6 +500,7 @@ impl EtherCrabWireRead for IpParam {
 /// Why an Ethernet frame cannot be fragmented for a given mailbox.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum FragmentError {
     /// The mailbox cannot carry a whole 32 byte block of EoE payload.
     ///
@@ -522,6 +523,27 @@ pub enum FragmentError {
         /// The largest length that can be expressed.
         limit: usize,
     },
+    /// A frame number or port does not fit its four bit field.
+    ///
+    /// Masking it silently, as the `EOE_HDR_*_SET` macros do, would put frame 16 on the
+    /// wire as frame 0 and collide with the frame before it.
+    TooWideForItsField {
+        /// The value that was offered.
+        value: u8,
+        /// Which field it was for.
+        what: Nibble,
+    },
+}
+
+/// A four bit header field, named for [`FragmentError::TooWideForItsField`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum Nibble {
+    /// The frame number, which identifies one Ethernet frame across its fragments.
+    FrameNumber,
+    /// The port of the SubDevice.
+    Port,
 }
 
 /// Splits an Ethernet frame into EoE fragments.
@@ -535,6 +557,8 @@ pub enum FragmentError {
 pub struct Fragments<'a> {
     frame: &'a [u8],
     /// Bytes of EoE payload one mailbox can carry: `mbx_l - 0x0A` (`ec_eoe.c:344`).
+    capacity: usize,
+    /// `capacity` rounded down to a whole number of 32 byte blocks.
     block: usize,
     frame_number: u8,
     port: u8,
@@ -549,28 +573,47 @@ impl<'a> Fragments<'a> {
 
     /// The offset field is six bits, counting blocks.
     const MAX_BLOCKS: usize = 0x3F;
+    const MAX_BLOCKS_U8: u8 = 0x3F;
 
     /// The longest frame whose size and offsets both fit the six bit field.
     pub const MAX_FRAME: usize = Self::MAX_BLOCKS * Self::BLOCK;
 
+    /// The frame number and the port are four bit fields.
+    const MAX_NIBBLE: u8 = 0x0F;
+
     /// Prepares to split `frame` for a mailbox that can carry `capacity` bytes of EoE
     /// payload.
     ///
+    /// `frame_number` identifies this frame at the receiver and has to differ from the
+    /// frame before it; it is **not** advanced here, because a counter is state and this
+    /// is an iterator over borrowed data. In the reference implementation it is a `static`
+    /// bumped once per frame (`ec_eoe.c:392`), so the caller now owns that.
+    ///
     /// # Errors
     ///
-    /// [`FragmentError`] if the mailbox cannot carry a whole block, or the frame is longer
-    /// than the offset field can name.
+    /// [`FragmentError`] if the mailbox cannot carry a whole block of a frame that has to
+    /// be split, the frame is longer than the offset field can name, or the frame number
+    /// or port does not fit its four bit field.
     pub fn new(
         frame: &'a [u8],
         capacity: usize,
         frame_number: u8,
         port: u8,
     ) -> Result<Self, FragmentError> {
+        for (value, what) in [(frame_number, Nibble::FrameNumber), (port, Nibble::Port)] {
+            if value > Self::MAX_NIBBLE {
+                return Err(FragmentError::TooWideForItsField { value, what });
+            }
+        }
+
         // Rounded down, as `((maxdata >> 5) << 5)` does - a fragment that is not a whole
         // number of blocks would give the next one an offset the field cannot express.
         let block = (capacity / Self::BLOCK) * Self::BLOCK;
 
-        if block == 0 {
+        // Only a frame that actually has to be split needs whole blocks. A mailbox of 40
+        // bytes carries a 10 byte frame perfectly well, and the reference implementation
+        // sends it - rejecting it outright would make such a SubDevice unusable for EoE.
+        if block == 0 && frame.len() > capacity {
             return Err(FragmentError::MailboxTooSmall { capacity });
         }
 
@@ -583,6 +626,7 @@ impl<'a> Fragments<'a> {
 
         Ok(Self {
             frame,
+            capacity,
             block,
             frame_number,
             port,
@@ -596,7 +640,10 @@ impl<'a> Fragments<'a> {
     ///
     /// `(psize + 31) >> 5` in the reference implementation.
     fn blocks(bytes: usize) -> u8 {
-        u8::try_from(bytes.div_ceil(Self::BLOCK)).unwrap_or(u8::MAX)
+        // Cannot saturate: `new` caps the frame at `MAX_FRAME`, so this is at most 63.
+        // Saturating to 255 would be worse than useless - the field masks it back to 63
+        // and puts a wrong frame size on the wire.
+        u8::try_from(bytes.div_ceil(Self::BLOCK)).unwrap_or(Self::MAX_BLOCKS_U8)
     }
 }
 
@@ -609,7 +656,17 @@ impl<'a> Iterator for Fragments<'a> {
         }
 
         let rest = self.frame.get(self.offset..)?;
-        let size = rest.len().min(self.block);
+
+        // `ec_eoe.c:367-372`: the rounding down to whole blocks applies **only** when the
+        // remainder does not fit in the mailbox. A remainder that fits goes out whole,
+        // even when it is not a multiple of 32 - it is the last fragment, so no later
+        // offset has to name a boundary inside it. Rounding unconditionally would split a
+        // 118 byte remainder into 96 + 22 and cost a mailbox round trip for nothing.
+        let size = if rest.len() > self.capacity {
+            self.block
+        } else {
+            rest.len()
+        };
         let last = size == rest.len();
 
         let data = rest.get(..size)?;
@@ -1315,6 +1372,78 @@ mod fragment_tests {
         assert_eq!(fragments.len(), 1);
         assert!(fragments[0].0.last_fragment);
         assert!(fragments[0].1.is_empty());
+    }
+
+    #[test]
+    fn a_remainder_that_fits_the_mailbox_goes_out_whole() {
+        // The band where rounding to 32 would be wrong: 118 bytes fit the mailbox but are
+        // not a multiple of 32. `ec_eoe.c:367` rounds ONLY when the remainder does not
+        // fit, so this is one fragment, not 96 + 22. Rounding unconditionally costs a
+        // mailbox round trip on roughly a quarter of all frame lengths at this size.
+        for length in [97, 100, MAX_DATA] {
+            let payload = vec![0u8; length];
+            let sizes: Vec<_> = Fragments::new(&payload, MAX_DATA, 0, 0)
+                .expect("fits")
+                .map(|(_, data)| data.len())
+                .collect();
+
+            assert_eq!(sizes, vec![length], "a {length} byte frame is one fragment");
+        }
+
+        // And 214 bytes, where the first fragment must still be rounded.
+        let payload = [0u8; 214];
+        let sizes: Vec<_> = Fragments::new(&payload, MAX_DATA, 0, 0)
+            .expect("fits")
+            .map(|(_, data)| data.len())
+            .collect();
+
+        assert_eq!(sizes, vec![96, 118], "round the first, send the rest whole");
+    }
+
+    #[test]
+    fn a_small_mailbox_still_carries_a_frame_that_fits_in_it() {
+        // Rejecting every small mailbox outright would make a SubDevice with a 40 byte
+        // mailbox unusable for EoE, although the reference implementation sends short
+        // frames through it perfectly well.
+        let sizes: Vec<_> = Fragments::new(&[0u8; 10], 31, 0, 0)
+            .expect("ten bytes fit thirty one")
+            .map(|(_, data)| data.len())
+            .collect();
+
+        assert_eq!(sizes, vec![10]);
+    }
+
+    #[test]
+    fn a_frame_number_or_port_that_does_not_fit_four_bits_is_rejected() {
+        // `EOE_HDR_FRAME_NO_SET` masks with 0xF. Frame 16 would go out as frame 0 and
+        // collide with the frame before it at any receiver that de-duplicates by number.
+        assert_eq!(
+            Fragments::new(&[0u8; 4], 64, 16, 0).unwrap_err(),
+            FragmentError::TooWideForItsField {
+                value: 16,
+                what: Nibble::FrameNumber
+            }
+        );
+        assert_eq!(
+            Fragments::new(&[0u8; 4], 64, 0, 255).unwrap_err(),
+            FragmentError::TooWideForItsField {
+                value: 255,
+                what: Nibble::Port
+            }
+        );
+        assert!(
+            Fragments::new(&[0u8; 4], 64, 15, 15).is_ok(),
+            "15 still fits"
+        );
+    }
+
+    #[test]
+    fn the_port_reaches_every_fragment() {
+        let payload = [0u8; 250];
+
+        for (header, _) in Fragments::new(&payload, MAX_DATA, 0, 5).expect("fits") {
+            assert_eq!(header.port, 5);
+        }
     }
 
     #[test]

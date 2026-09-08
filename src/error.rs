@@ -1,6 +1,7 @@
 //! EtherCrab error types.
 
 pub use crate::mailbox::coe::CoeAbortCode;
+pub use crate::mailbox::eoe::FragmentError;
 use crate::{AlStatusCode, SubDeviceState, command::Command, fmt};
 use core::num::TryFromIntError;
 
@@ -22,6 +23,8 @@ pub enum Error {
     Timeout(TimeoutError),
     /// An EEPROM error was encountered.
     Eeprom(EepromError),
+    /// An Ethernet frame could not be split into EoE fragments.
+    Fragment(FragmentError),
     /// A fixed size array was not large enough to hold a given item type.
     Capacity(Item),
     /// A string was too long to fit in a fixed size buffer.
@@ -109,6 +112,23 @@ impl core::fmt::Display for Error {
             }
             Error::Timeout(kind) => write!(f, "timeout: {}", kind),
             Error::Eeprom(e) => write!(f, "eeprom: {}", e),
+            Error::Fragment(e) => match e {
+                FragmentError::MailboxTooSmall { capacity } => write!(
+                    f,
+                    "mailbox of {} bytes cannot carry a whole 32 byte EoE block",
+                    capacity
+                ),
+                FragmentError::FrameTooLong { length, limit } => write!(
+                    f,
+                    "ethernet frame of {} bytes is longer than the {} an EoE offset can name",
+                    length, limit
+                ),
+                FragmentError::TooWideForItsField { value, what } => write!(
+                    f,
+                    "{:?} {} does not fit the four bits EoE gives it",
+                    what, value
+                ),
+            },
             Error::Capacity(item) => write!(f, "not enough capacity for {:?}", item),
             Error::StringTooLong {
                 max_length,
@@ -482,6 +502,12 @@ impl From<PduError> for Error {
 impl From<EepromError> for Error {
     fn from(e: EepromError) -> Self {
         Self::Eeprom(e)
+    }
+}
+
+impl From<FragmentError> for Error {
+    fn from(e: FragmentError) -> Self {
+        Self::Fragment(e)
     }
 }
 

@@ -40,6 +40,11 @@ A pure Rust EtherCAT MainDevice supporting std and no_std environments.
   port too wide for its four bit field. The frame number is *not* rejected when it passes
   15 - it is a counter the reference implementation deliberately lets the field wrap.
 
+  `Reassembly` puts the fragments back together into a caller supplied buffer. It differs
+  from the reference implementation in one place on purpose: a fragment that does not fit
+  is reported where it happens, rather than dropped silently so that the *next* fragment
+  fails an order check and names the wrong problem.
+
 ## [0.7.1] - 2026-03-23
 
 ### Fixed

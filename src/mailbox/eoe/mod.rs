@@ -719,6 +719,277 @@ impl<'a> Iterator for Fragments<'a> {
     }
 }
 
+/// Why a fragment could not be added to the frame being reassembled.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum ReassemblyError {
+    /// The frame is not a data fragment, so it carries no part of an Ethernet frame.
+    NotAFragment {
+        /// What it was instead.
+        frame_type: FrameType,
+    },
+    /// A fragment arrived out of order.
+    OutOfOrder {
+        /// The fragment number that was due.
+        expected: u8,
+        /// The one that arrived.
+        received: u8,
+    },
+    /// A fragment belongs to a different frame than the one being reassembled.
+    WrongFrame {
+        /// The frame number being reassembled.
+        expected: u8,
+        /// The one the fragment named.
+        received: u8,
+    },
+    /// A fragment named an offset other than where it has to go.
+    WrongOffset {
+        /// Where the fragment has to start, in bytes.
+        expected: u16,
+        /// Where it said it starts.
+        received: u16,
+    },
+    /// Fragment zero announced a frame larger than the buffer.
+    FrameTooLongForBuffer {
+        /// The frame size the fragment announced, in bytes.
+        announced: usize,
+        /// The buffer's capacity, in bytes.
+        capacity: usize,
+    },
+    /// The fragments add up to more than fragment zero announced.
+    Overrun {
+        /// The frame size fragment zero announced, in bytes.
+        announced: usize,
+        /// What the frame would grow to with this fragment, in bytes.
+        would_be: usize,
+    },
+    /// The last fragment says a timestamp is appended, and it is not there.
+    TimestampMissing {
+        /// Bytes the last fragment carried.
+        length: usize,
+    },
+}
+
+impl core::fmt::Display for ReassemblyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotAFragment { frame_type } => {
+                write!(f, "{:?} carries no ethernet fragment", frame_type)
+            }
+            Self::OutOfOrder { expected, received } => write!(
+                f,
+                "fragment {} arrived where fragment {} was due",
+                received, expected
+            ),
+            Self::WrongFrame { expected, received } => write!(
+                f,
+                "a fragment of frame {} arrived while frame {} was being reassembled",
+                received, expected
+            ),
+            Self::WrongOffset { expected, received } => write!(
+                f,
+                "a fragment says it starts at byte {} but has to start at {}",
+                received, expected
+            ),
+            Self::FrameTooLongForBuffer {
+                announced,
+                capacity,
+            } => write!(
+                f,
+                "an announced frame of {} bytes does not fit a buffer of {}",
+                announced, capacity
+            ),
+            Self::Overrun {
+                announced,
+                would_be,
+            } => write!(
+                f,
+                "the fragments add up to {} bytes where {} were announced",
+                would_be, announced
+            ),
+            Self::TimestampMissing { length } => write!(
+                f,
+                "the last fragment promises an appended timestamp but carries only {} bytes",
+                length
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for ReassemblyError {}
+
+/// What a fragment completed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reassembled<'a> {
+    /// The frame is not finished; more fragments are due.
+    More,
+    /// A complete Ethernet frame.
+    Frame(&'a [u8]),
+}
+
+/// Puts EoE fragments back together into an Ethernet frame.
+///
+/// Ported from `ecx_EOErecv` (`ec_eoe.c:437-557`), with one deliberate difference. When a
+/// fragment does not fit the buffer, the reference implementation **drops it silently**
+/// (`:509`) and does not advance its fragment counter, so the *next* fragment fails the
+/// order check and the error names the wrong thing. Here an overrun is reported where it
+/// happens.
+///
+/// The frame is assembled in a caller supplied buffer, so this does no allocation.
+#[derive(Debug)]
+pub struct Reassembly<'buf> {
+    buffer: &'buf mut [u8],
+    frame: Option<Partial>,
+}
+
+/// The frame currently being put back together.
+#[derive(Copy, Clone, Debug)]
+struct Partial {
+    number: u8,
+    next_fragment: u8,
+    /// Bytes written so far, which is also where the next fragment has to start.
+    filled: usize,
+    /// What fragment zero announced, rounded up to 32 bytes.
+    announced: usize,
+}
+
+impl<'buf> Reassembly<'buf> {
+    /// A reassembly that writes into `buffer`.
+    ///
+    /// The buffer has to be large enough for the frames the SubDevice sends; a frame that
+    /// announces more is refused before anything is written.
+    pub fn new(buffer: &'buf mut [u8]) -> Self {
+        Self {
+            buffer,
+            frame: None,
+        }
+    }
+
+    /// Adds one fragment.
+    ///
+    /// # Errors
+    ///
+    /// [`ReassemblyError`] if the fragment is not a data fragment, does not belong to the
+    /// frame being reassembled, or does not fit.
+    pub fn push(
+        &mut self,
+        header: EoeHeader,
+        data: &[u8],
+    ) -> Result<Reassembled<'_>, ReassemblyError> {
+        let Some(fragment) = header.fragment() else {
+            return Err(ReassemblyError::NotAFragment {
+                frame_type: header.frame_type,
+            });
+        };
+
+        // A fragment zero always starts a new frame, even mid-reassembly: a SubDevice that
+        // gives up on one simply begins the next. Refusing it would wedge the link, and
+        // the reference implementation lets it through as well - only to fail it one check
+        // later on the frame number, which names the wrong problem (`ec_eoe.c:467-476`).
+        if fragment.number == 0 {
+            let announced = usize::from(fragment.total_frame_size().unwrap_or_default());
+
+            if announced > self.buffer.len() {
+                return Err(ReassemblyError::FrameTooLongForBuffer {
+                    announced,
+                    capacity: self.buffer.len(),
+                });
+            }
+
+            self.frame = Some(Partial {
+                number: fragment.frame_number,
+                next_fragment: 0,
+                filled: 0,
+                announced,
+            });
+        }
+
+        let mut partial = self.frame.ok_or(ReassemblyError::OutOfOrder {
+            expected: 0,
+            received: fragment.number,
+        })?;
+
+        if fragment.number != partial.next_fragment {
+            return Err(ReassemblyError::OutOfOrder {
+                expected: partial.next_fragment,
+                received: fragment.number,
+            });
+        }
+
+        if fragment.frame_number != partial.number {
+            return Err(ReassemblyError::WrongFrame {
+                expected: partial.number,
+                received: fragment.frame_number,
+            });
+        }
+
+        // Fragment zero's field carries the size, not an offset, so there is nothing to
+        // compare it against.
+        if let Some(offset) = fragment.offset() {
+            let expected = u16::try_from(partial.filled).unwrap_or(u16::MAX);
+
+            if offset != expected {
+                return Err(ReassemblyError::WrongOffset {
+                    expected,
+                    received: offset,
+                });
+            }
+        }
+
+        let end = partial.filled + data.len();
+
+        // `announced` was checked against the buffer when fragment zero arrived, so this
+        // one comparison covers both: the device cannot send more than it promised, and
+        // what it promised fits.
+        if end > partial.announced {
+            return Err(ReassemblyError::Overrun {
+                announced: partial.announced,
+                would_be: end,
+            });
+        }
+
+        self.buffer
+            .get_mut(partial.filled..end)
+            .ok_or(ReassemblyError::Overrun {
+                announced: partial.announced,
+                would_be: end,
+            })?
+            .copy_from_slice(data);
+
+        partial.filled = end;
+        partial.next_fragment += 1;
+        self.frame = Some(partial);
+
+        if !header.last_fragment {
+            return Ok(Reassembled::More);
+        }
+
+        // The timestamp is four bytes at the very end and is not part of the frame.
+        let length = if header.time_append {
+            partial
+                .filled
+                .checked_sub(4)
+                .ok_or(ReassemblyError::TimestampMissing {
+                    length: partial.filled,
+                })?
+        } else {
+            partial.filled
+        };
+
+        self.frame = None;
+
+        self.buffer
+            .get(..length)
+            .map(Reassembled::Frame)
+            .ok_or(ReassemblyError::Overrun {
+                announced: partial.announced,
+                would_be: length,
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1549,6 +1820,235 @@ mod fragment_tests {
                 .expect("data")
                 .number,
             62
+        );
+    }
+}
+
+#[cfg(test)]
+mod reassembly_tests {
+    use super::*;
+
+    /// Splits `frame` the way a SubDevice would, so the receive side can be fed exactly
+    /// what the send side produces.
+    fn sent(frame: &[u8], capacity: usize, number: u8) -> Vec<(EoeHeader, Vec<u8>)> {
+        Fragments::new(frame, capacity, number, 0)
+            .expect("fits")
+            .map(|(header, data)| (header, data.to_vec()))
+            .collect()
+    }
+
+    fn feed(reassembly: &mut Reassembly<'_>, parts: &[(EoeHeader, Vec<u8>)]) -> Option<Vec<u8>> {
+        let mut out = None;
+
+        for (header, data) in parts {
+            if let Reassembled::Frame(frame) = reassembly.push(*header, data).expect("valid") {
+                out = Some(frame.to_vec());
+            }
+        }
+
+        out
+    }
+
+    #[test]
+    fn what_the_sender_split_the_receiver_puts_back() {
+        let frame: Vec<u8> = (0..=255u8).cycle().take(1514).collect();
+        let mut buffer = [0u8; 2048];
+        let mut reassembly = Reassembly::new(&mut buffer);
+
+        assert_eq!(feed(&mut reassembly, &sent(&frame, 118, 3)), Some(frame));
+    }
+
+    #[test]
+    fn a_single_fragment_frame_is_complete_at_once() {
+        let mut buffer = [0u8; 128];
+        let mut reassembly = Reassembly::new(&mut buffer);
+        let parts = sent(b"hello", 118, 0);
+
+        assert_eq!(parts.len(), 1);
+        match reassembly.push(parts[0].0, &parts[0].1) {
+            Ok(Reassembled::Frame(frame)) => assert_eq!(frame, b"hello"),
+            other => panic!("expected a complete frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fragment_out_of_order_is_rejected() {
+        // A SubDevice that skips fragment 1 must not have fragment 2 written at the wrong
+        // place. The reference implementation checks this too (`ec_eoe.c:467`).
+        let frame = [0u8; 250];
+        let mut buffer = [0u8; 512];
+        let mut reassembly = Reassembly::new(&mut buffer);
+        let parts = sent(&frame, 118, 0);
+
+        reassembly
+            .push(parts[0].0, &parts[0].1)
+            .expect("fragment zero");
+
+        assert_eq!(
+            reassembly.push(parts[2].0, &parts[2].1),
+            Err(ReassemblyError::OutOfOrder {
+                expected: 1,
+                received: 2
+            })
+        );
+    }
+
+    #[test]
+    fn a_fragment_from_another_frame_is_rejected() {
+        // `ec_eoe.c:496`: mid-frame, the frame number has to keep matching.
+        let frame = [0u8; 250];
+        let mut buffer = [0u8; 512];
+        let mut reassembly = Reassembly::new(&mut buffer);
+
+        let ours = sent(&frame, 118, 3);
+        let theirs = sent(&frame, 118, 4);
+
+        reassembly
+            .push(ours[0].0, &ours[0].1)
+            .expect("fragment zero");
+
+        assert_eq!(
+            reassembly.push(theirs[1].0, &theirs[1].1),
+            Err(ReassemblyError::WrongFrame {
+                expected: 3,
+                received: 4
+            })
+        );
+    }
+
+    #[test]
+    fn a_fragment_that_claims_the_wrong_offset_is_rejected() {
+        // `ec_eoe.c:502`. Trusting it would leave a hole in the frame.
+        let frame = [0u8; 250];
+        let mut buffer = [0u8; 512];
+        let mut reassembly = Reassembly::new(&mut buffer);
+        let parts = sent(&frame, 118, 0);
+
+        reassembly
+            .push(parts[0].0, &parts[0].1)
+            .expect("fragment zero");
+
+        let lying = parts[1].0.with_fragment(1, 9, 0);
+
+        assert_eq!(
+            reassembly.push(lying, &parts[1].1),
+            Err(ReassemblyError::WrongOffset {
+                expected: 96,
+                received: 288
+            })
+        );
+    }
+
+    #[test]
+    fn a_frame_larger_than_the_buffer_is_refused_before_anything_is_written() {
+        // `ec_eoe.c:481` checks this on fragment zero, which is the only fragment that
+        // announces the size - so it can be refused before a single byte is copied.
+        let frame = [0u8; 250];
+        let mut buffer = [0u8; 64];
+        let mut reassembly = Reassembly::new(&mut buffer);
+        let parts = sent(&frame, 118, 0);
+
+        assert_eq!(
+            reassembly.push(parts[0].0, &parts[0].1),
+            Err(ReassemblyError::FrameTooLongForBuffer {
+                announced: 256,
+                capacity: 64
+            })
+        );
+    }
+
+    #[test]
+    fn a_fragment_that_overruns_what_was_announced_is_rejected() {
+        // The size is announced once, in fragment zero. A device that then sends more
+        // than it promised is lying about one of the two, and the reference
+        // implementation silently DROPS the fragment (`ec_eoe.c:509`) without advancing
+        // its counter - so the next fragment fails the order check instead, and the error
+        // names the wrong thing.
+        let frame = [0u8; 200];
+        let mut buffer = [0u8; 512];
+        let mut reassembly = Reassembly::new(&mut buffer);
+        let parts = sent(&frame, 118, 0);
+
+        reassembly
+            .push(parts[0].0, &parts[0].1)
+            .expect("fragment zero");
+
+        let too_much = vec![0u8; 300];
+
+        assert_eq!(
+            reassembly.push(parts[1].0, &too_much),
+            Err(ReassemblyError::Overrun {
+                announced: 224,
+                would_be: 396
+            })
+        );
+    }
+
+    #[test]
+    fn a_new_fragment_zero_starts_over() {
+        // A SubDevice that gives up on a frame simply starts the next one. Dropping the
+        // half assembled frame is right; refusing the new one would wedge the link.
+        let frame = [1u8; 250];
+        let other = [2u8; 40];
+        let mut buffer = [0u8; 512];
+        let mut reassembly = Reassembly::new(&mut buffer);
+
+        let abandoned = sent(&frame, 118, 3);
+        let fresh = sent(&other, 118, 4);
+
+        reassembly
+            .push(abandoned[0].0, &abandoned[0].1)
+            .expect("fragment zero");
+
+        match reassembly.push(fresh[0].0, &fresh[0].1) {
+            Ok(Reassembled::Frame(complete)) => assert_eq!(complete, &other[..]),
+            other => panic!("expected the new frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_appended_timestamp_is_not_part_of_the_frame() {
+        // `ec_eoe.c:519-522`: with TIME_APPEND set, the last four bytes are a timestamp
+        // and the frame is that much shorter.
+        let mut buffer = [0u8; 128];
+        let mut reassembly = Reassembly::new(&mut buffer);
+
+        let mut header = EoeHeader::new(FrameType::FragData, 0).with_fragment(0, 1, 0);
+        header.last_fragment = true;
+        header.time_append = true;
+
+        match reassembly.push(header, b"payload!TIME") {
+            Ok(Reassembled::Frame(frame)) => assert_eq!(frame, b"payload!"),
+            other => panic!("expected the frame without its timestamp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_timestamp_that_is_not_there_is_an_error() {
+        let mut buffer = [0u8; 128];
+        let mut reassembly = Reassembly::new(&mut buffer);
+
+        let mut header = EoeHeader::new(FrameType::FragData, 0).with_fragment(0, 1, 0);
+        header.last_fragment = true;
+        header.time_append = true;
+
+        assert_eq!(
+            reassembly.push(header, b"abc"),
+            Err(ReassemblyError::TimestampMissing { length: 3 })
+        );
+    }
+
+    #[test]
+    fn only_a_data_frame_carries_fragments() {
+        let mut buffer = [0u8; 128];
+        let mut reassembly = Reassembly::new(&mut buffer);
+        let header = EoeHeader::new(FrameType::InitResp, 0);
+
+        assert_eq!(
+            reassembly.push(header, b""),
+            Err(ReassemblyError::NotAFragment {
+                frame_type: FrameType::InitResp
+            })
         );
     }
 }

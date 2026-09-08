@@ -2971,7 +2971,7 @@ mod mailbox_tests {
 
 /// Feeds one received mailbox to a [`Reassembly`].
 ///
-/// Ported from `ecx_EOEreadfragment` (`ec_eoe.c:559-660`) and the body of `ecx_EOErecv`'s
+/// Ported from `ecx_EOEreadfragment` (`ec_eoe.c:559-665`) and the body of `ecx_EOErecv`'s
 /// loop (`:459-534`). `payload` is the whole mailbox as it was read: a six byte mailbox
 /// header, four bytes of EoE header, and the fragment.
 ///
@@ -2991,8 +2991,11 @@ mod mailbox_tests {
 /// something that is not EoE - one mailbox carries every protocol a SubDevice supports, so
 /// a CoE response can arrive while an EoE fragment is expected.
 ///
-/// [`Error::Mailbox`] with [`MailboxError::TooLong`] if the header's length does not fit
-/// the bytes that were read, or is under the four bytes an EoE header alone needs.
+/// [`Error::Wire`] with [`WireError::ReadBufferTooShort`] if the announced payload is not
+/// there: either the header's length runs past the bytes that were read, or it is under
+/// the four bytes an EoE header alone needs. Both say the same thing - what the mailbox
+/// announced did not arrive - and that is what the crate's own truncation error means,
+/// so there is no new variant and no invented number for it.
 ///
 /// [`Error::Reassembly`] for a fragment the reassembly refuses, and [`Error::Wire`] for a
 /// header that does not decode.
@@ -3015,14 +3018,13 @@ pub(crate) fn push_mailbox<'buf>(
     let length = usize::from(mailbox.length);
 
     // `eoedatasize = length - 4` (`ec_eoe.c:463`), which underflows there for a length
-    // under four. The reference then hands `memcpy` a huge size; here it is an error.
+    // under four. The reference then hands `memcpy` a size near `SIZE_MAX`; here both that
+    // and a length running past what arrived are the same answer - the announced payload
+    // is not there - and that is what `ReadBufferTooShort` says.
     let announced = payload
         .get(MailboxHeader::PACKED_LEN..MailboxHeader::PACKED_LEN + length)
         .filter(|body| body.len() >= EoeHeader::PACKED_LEN)
-        .ok_or(Error::Mailbox(MailboxError::TooLong {
-            address: 0,
-            sub_index: 0,
-        }))?;
+        .ok_or(WireError::ReadBufferTooShort)?;
 
     let header = EoeHeader::unpack_from_slice(announced)?;
 
@@ -3036,7 +3038,7 @@ pub(crate) fn push_mailbox<'buf>(
 ///
 /// The reassembly is **built and dropped inside this call**, which is the reference
 /// implementation's own shape - `ecx_EOErecv` keeps its four state variables as locals
-/// (`ec_eoe.c:441-452`). A frame is whole when this returns, so there is nothing to carry
+/// (`ec_eoe.c:442-452`). A frame is whole when this returns, so there is nothing to carry
 /// over; a caller that wants to keep a half assembled frame across a timeout holds its own
 /// [`Reassembly`] and feeds it with [`push_mailbox`].
 ///
@@ -3698,10 +3700,7 @@ mod mailbox_path_tests {
 
             assert_eq!(
                 push_mailbox(&mut reassembly, &mailbox),
-                Err(Error::Mailbox(MailboxError::TooLong {
-                    address: 0,
-                    sub_index: 0
-                })),
+                Err(Error::Wire(WireError::ReadBufferTooShort)),
                 "a mailbox announcing {} bytes",
                 length
             );
@@ -3726,11 +3725,87 @@ mod mailbox_path_tests {
 
         assert_eq!(
             push_mailbox(&mut reassembly, &mailbox),
-            Err(Error::Mailbox(MailboxError::TooLong {
-                address: 0,
-                sub_index: 0
+            Err(Error::Wire(WireError::ReadBufferTooShort))
+        );
+    }
+
+    #[test]
+    fn a_fragment_the_reassembly_refuses_is_reported_as_such() {
+        // The `# Errors` list promises `Error::Reassembly` for this, and a promise in a doc
+        // comment that no test makes is how this branch has already been wrong twice.
+        let mut buffer = [0u8; 64];
+        let mut reassembly = Reassembly::new(&mut buffer, PORT).expect("A reassembly");
+
+        let mailbox = mailbox_holding(
+            EoeHeader {
+                last_fragment: true,
+                ..EoeHeader::new(FrameType::FragData, PORT + 1).with_fragment(0, 1, 1)
+            },
+            1,
+            b"four",
+        );
+
+        assert_eq!(
+            push_mailbox(&mut reassembly, &mailbox),
+            Err(Error::Reassembly(ReassemblyError::WrongPort {
+                expected: PORT,
+                received: PORT + 1
             }))
         );
+    }
+
+    #[test]
+    fn an_eoe_header_that_does_not_decode_is_reported_as_a_wire_error() {
+        // Frame types 10 to 15 fit the field and mean nothing. A SubDevice must not be able
+        // to take the MainDevice down, and the error has to say what it is: the header, not
+        // the mailbox and not the reassembly.
+        let mut buffer = [0u8; 64];
+        let mut reassembly = Reassembly::new(&mut buffer, PORT).expect("A reassembly");
+
+        let mut mailbox = mailbox_holding(
+            EoeHeader {
+                last_fragment: true,
+                ..EoeHeader::new(FrameType::FragData, PORT).with_fragment(0, 1, 1)
+            },
+            1,
+            b"four",
+        );
+        // The frame type is the low nibble of the first EoE header byte.
+        mailbox[6] = (mailbox[6] & 0xF0) | 10;
+
+        assert!(
+            matches!(push_mailbox(&mut reassembly, &mailbox), Err(Error::Wire(_))),
+            "an undefined frame type is a wire error"
+        );
+    }
+
+    #[test]
+    fn a_buffer_handed_back_still_holds_what_arrived() {
+        // `into_buffer` says the bytes are left as they are rather than cleared, and that a
+        // half assembled frame is abandoned rather than returned.
+        let mut buffer = [0u8; 64];
+
+        let payload = (0..32u8).collect::<Vec<_>>();
+
+        let mut reassembly = Reassembly::new(&mut buffer, PORT).expect("A reassembly");
+
+        // Fragment zero of a frame that announces 64 bytes, so the frame is not finished.
+        let mailbox = mailbox_holding(
+            EoeHeader::new(FrameType::FragData, PORT).with_fragment(0, 2, 1),
+            1,
+            &payload,
+        );
+
+        assert_eq!(
+            push_mailbox(&mut reassembly, &mailbox).expect("A fragment"),
+            Reassembled::More
+        );
+
+        assert!(reassembly.in_progress().is_some(), "half a frame is there");
+
+        let handed_back = reassembly.into_buffer();
+
+        assert_eq!(&handed_back[..32], payload.as_slice());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]

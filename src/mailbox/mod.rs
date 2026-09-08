@@ -18,9 +18,12 @@ use core::ops::Deref;
 /// it serves CoE and EoE alike rather than each carrying its own copy.
 ///
 /// Note the pairing of the two errors below: `.write` is reported as `NoReadMailbox` and
-/// `.read` as `NoWriteMailbox`. That looks swapped and is kept exactly as it was found -
-/// no test covers it, so changing it here would be an unreviewed behaviour change riding
-/// along in a refactor.
+/// `.read` as `NoWriteMailbox`. The *names* look swapped, but the variants' own doc
+/// comments agree with this pairing - `NoReadMailbox` is documented as "a SubDevice has no
+/// write (SubDevice IN) mailbox". (Their `Display` text then says the opposite again, so
+/// the confusion is upstream's and sits in three places.) Kept exactly as found: no test
+/// distinguishes them - the only consumer matches both in one arm - so changing it here
+/// would be an unreviewed behaviour change riding along in a refactor.
 pub(crate) async fn wait_for_mailboxes<S>(
     subdevice: &SubDeviceRef<'_, S>,
 ) -> Result<(Mailbox, Mailbox), Error>

@@ -16,6 +16,11 @@ use core::ops::Deref;
 ///
 /// Nothing here is protocol specific - it is sync manager status and mailbox addresses - so
 /// it serves CoE and EoE alike rather than each carrying its own copy.
+///
+/// Note the pairing of the two errors below: `.write` is reported as `NoReadMailbox` and
+/// `.read` as `NoWriteMailbox`. That looks swapped and is kept exactly as it was found -
+/// no test covers it, so changing it here would be an unreviewed behaviour change riding
+/// along in a refactor.
 pub(crate) async fn wait_for_mailboxes<S>(
     subdevice: &SubDeviceRef<'_, S>,
 ) -> Result<(Mailbox, Mailbox), Error>
@@ -100,6 +105,13 @@ where
 }
 
 /// Waits for a SubDevice's OUT mailbox to fill, then reads it.
+///
+/// The returned PDU borrows from the `MainDevice`, not from the `SubDeviceRef` handed in.
+/// That is where it genuinely comes from - `receive_slice` derives it from
+/// `subdevice.maindevice`, a `Copy` reference - and saying so is **weaker** than the
+/// elided lifetime this had as a method, which tied it to `&self`. A caller may now hold
+/// the PDU across a re-borrow of the SubDevice, which the old shape rejected. Nothing does
+/// yet; it is written down because it is the one thing the move did change.
 pub(crate) async fn wait_for_mailbox_response<'maindevice, S>(
     subdevice: &SubDeviceRef<'maindevice, S>,
     read_mailbox: &Mailbox,

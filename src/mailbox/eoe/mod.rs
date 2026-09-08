@@ -2213,10 +2213,12 @@ mod reassembly_tests {
 
     #[test]
     fn a_second_port_cannot_finish_a_frame_the_first_one_started() {
-        // The splice this guard exists to prevent. Both ports start at frame number zero,
-        // so fragment number, frame number and offset all line up: without a port check on
-        // EVERY fragment, port 1's tail completes port 0's head and a frame goes out that
-        // is half of each, with no error anywhere.
+        // The splice this guard exists to prevent. Here both ports are given frame number
+        // zero, so fragment number, frame number and offset all line up: without a port
+        // check on EVERY fragment, port 1's tail completes port 0's head and a frame goes
+        // out that is half of each, with no error anywhere. Two ports need not agree on
+        // the frame number - SOEM's sender shares one counter across ports - but nothing
+        // stops them from agreeing, and then only the port tells them apart.
         let ours = [0xAAu8; 250];
         let theirs = [0xBBu8; 250];
         let mut buffer = [0u8; 512];

@@ -87,7 +87,7 @@ where
 ///
 /// This is the half of [`wait_for_mailboxes`] that a **send** needs, and the whole of what
 /// the reference implementation's send does: `ecx_mbxsend` writes the mailbox and, if the
-/// write fails, waits on `ecx_mbxempty` and retries (`ec_main.c:1565-1573`). It never
+/// write fails, waits on `ecx_mbxempty` and retries (`ec_main.c:1565-1575`). It never
 /// touches the OUT mailbox.
 ///
 /// That is the reason this is separate rather than a convenience. [`wait_for_mailboxes`]

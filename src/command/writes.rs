@@ -66,6 +66,13 @@ impl WrappedWrite {
     /// Set an explicit length for the PDU instead of taking it from the sent data.
     ///
     /// The length will be the _maximum_ of the value set here and the data sent.
+    ///
+    /// It applies to all three send methods. It used to be honoured by
+    /// [`send`](WrappedWrite::send) alone while
+    /// [`send_receive`](WrappedWrite::send_receive) and
+    /// [`send_receive_slice`](WrappedWrite::send_receive_slice) passed `None` through and
+    /// sized the PDU from the data - which is not what this method says it does. No caller
+    /// combined the two, so nothing changed behaviour when that was fixed.
     pub fn with_len(self, new_len: impl Into<u16>) -> Self {
         Self {
             len_override: Some(new_len.into()),
@@ -109,7 +116,7 @@ impl WrappedWrite {
     where
         T: EtherCrabWireRead,
     {
-        self.common(maindevice, value, None)
+        self.common(maindevice, value, self.len_override)
             .await?
             .maybe_wkc(self.wkc)
             .and_then(|data| Ok(T::unpack_from_slice(&data)?))
@@ -121,7 +128,7 @@ impl WrappedWrite {
         maindevice: &'maindevice MainDevice<'maindevice>,
         value: impl EtherCrabWireWrite,
     ) -> Result<ReceivedPdu<'maindevice>, Error> {
-        self.common(maindevice, value, None)
+        self.common(maindevice, value, self.len_override)
             .await?
             .maybe_wkc(self.wkc)
     }

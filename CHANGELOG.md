@@ -33,11 +33,14 @@ A pure Rust EtherCAT MainDevice supporting std and no_std environments.
   last octet first, and the DNS name field is always 32 bytes, zero padded.
 
   `Fragments` splits an Ethernet frame into EoE fragments for a mailbox of a given size.
-  It is a pure iterator over borrowed data. `FragmentError` names the three cases it
-  refuses, all of which the reference implementation lets through: a mailbox too small to
+  It is a pure iterator over borrowed data. `FragmentError` names the four cases it
+  refuses, three of which the reference implementation lets through: a mailbox too small to
   carry one 32 byte block of a frame that has to be split (which loops there for as long as
   the sends keep succeeding), a frame longer than the six bit offset field can name, and a
-  port too wide for its four bit field. The frame number is *not* rejected when it passes
+  port too wide for its four bit field. The fourth, a mailbox that cannot hold the mailbox
+  and EoE headers at all, is the one the reference does guard (`maxdata < 0`), and it is a
+  separate variant because it says the SubDevice cannot do EoE rather than that this frame
+  needs a bigger mailbox. The frame number is *not* rejected when it passes
   15 - it is a counter the reference implementation deliberately lets the field wrap.
 
   `Reassembly` puts the fragments back together into a caller supplied buffer, one per
@@ -54,6 +57,13 @@ A pure Rust EtherCAT MainDevice supporting std and no_std environments.
   `EoeHeader::write_fragment` builds the mailbox payload for one fragment: the mailbox
   header, the EoE header and the data. Its length field counts the EoE header and the data
   but *not* the mailbox header, as `ecx_EOEsend` writes it.
+
+### Fixed
+
+- `WrappedWrite::with_len` is now honoured by `send_receive` and `send_receive_slice` as
+  well as by `send`. Both passed `None` for the length override and sized the PDU from the
+  data instead, which is not what `with_len` says it does. No caller combined the two, so
+  no behaviour changed.
 
 ## [0.7.1] - 2026-03-23
 

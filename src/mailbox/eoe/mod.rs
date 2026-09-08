@@ -1150,10 +1150,14 @@ impl EoeHeader {
     ///                ^--- length = 4 + data.len()
     /// ```
     ///
-    /// `counter` is the mailbox counter, 1 to 7. It is a three bit field and is **masked**
-    /// like every other value this crate puts in that field, so 8 becomes 0 - which the
-    /// field's own documentation calls reserved. Pass what
-    /// [`SubDevice::mailbox_counter`](crate::SubDevice) gives you.
+    /// `counter` is the mailbox counter: **1 to 7 inclusive**, wrapping back to 1, with 0
+    /// reserved. It is a three bit field and is masked like every other value this crate
+    /// puts there, so 8 arrives as 0 and 9 as 1 - silently, as the CoE requests here do it
+    /// too.
+    ///
+    /// A caller has to keep that counter itself for now; the crate's own is
+    /// `SubDevice::mailbox_counter`, which is crate-internal. The send path that will use
+    /// this method takes it from there, so once that lands nobody outside has to count.
     ///
     /// Pure, so the byte layout is testable without a bus. Only the bytes it wrote are
     /// returned; the rest of `buffer` is left as the caller had it.
@@ -1180,7 +1184,7 @@ impl EoeHeader {
             // `ecx_EOEsend` writes `4 + txframesize` - the EoE header plus the data, not
             // the mailbox header. Counting the mailbox header too would make the SubDevice
             // read six bytes past the frame. EtherCrab's own CoE requests count the same
-            // way (`SdoNormal::upload` writes 10 for a 16 byte request).
+            // way: `SdoNormal` is 12 bytes on the wire and writes 10.
             length: u16::try_from(length).map_err(|_| WireError::ArrayLength)?,
             priority: Priority::Lowest,
             mailbox_type: MailboxType::Eoe,
